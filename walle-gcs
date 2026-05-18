@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Walle GCS launcher — the "executable" for walle_gcs.py.
+#
+# Double-click it in the file manager, or run ./walle-gcs from a terminal.
+# It finds the project venv and runs the GCS with the correct working dir,
+# so you never have to type the venv path by hand.
+# ─────────────────────────────────────────────────────────────────────────────
+set -e
+
+# Resolve this launcher's real location (follows symlinks).
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"   # .../rosetta/walle_gcs
+ROOT="$(dirname "$HERE")"                                # .../rosetta  (project root)
+PY="$ROOT/venv/bin/python"
+
+if [ ! -x "$PY" ]; then
+    echo "Error: project virtualenv not found at:" >&2
+    echo "  $PY" >&2
+    echo "Create it (python -m venv venv) and install the GCS dependencies first." >&2
+    exit 1
+fi
+
+# Run from the project root: model weights referenced by bare relative paths
+# (e.g. yolov8n-pose.pt) and the shared slam_engine.py live there.
+cd "$ROOT"
+exec "$PY" "$HERE/walle_gcs.py" "$@"

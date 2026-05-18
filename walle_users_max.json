@@ -1,0 +1,12 @@
+{
+  "admin": {
+    "hash": "bd3a7c09ddaec5272095d48a511487467c61b6115b9b557a7b8d1dab6db221c1",
+    "salt": "67cdc079efe98fec4766f83e08977b10",
+    "role": "admin"
+  },
+  "nandhita": {
+    "hash": "6946eda0292874358f23796d1ab63ac54bb540691f18d4b30caaec822df3df16",
+    "salt": "67c902fd13da57cb289976c2e092c636",
+    "role": "pilot"
+  }
+}

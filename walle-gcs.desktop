@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Walle GCS
+GenericName=Drone Ground Control Station
+Comment=Walle Drone Ground Control Station — Betaflight/ELRS FPV control + AI feed
+Exec="/home/ndrone/Downloads/Drone Development/Drone Development/rosetta/walle_gcs/walle-gcs"
+Path=/home/ndrone/Downloads/Drone Development/Drone Development/rosetta
+Icon=applications-engineering
+Terminal=true
+Categories=Utility;Science;

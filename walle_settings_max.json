@@ -1,0 +1,62 @@
+{
+  "profile": {
+    "name": "Walle-1",
+    "frame": "Quad X",
+    "battery_cells": 4,
+    "battery_capacity": 1500,
+    "drone_id": "WALLE-001"
+  },
+  "protocol": {
+    "type": "ELRS / CRSF",
+    "baud": "420000",
+    "telem_rate": "500 Hz"
+  },
+  "video_streaming": {
+    "ip": "127.0.0.1",
+    "port": 5600,
+    "bitrate": "5000 kbps",
+    "codec": "H.264",
+    "aspect_ratio": "16:9 (DJI O4)",
+    "resolution": "1920x1080"
+  },
+  "webrtc": {
+    "enabled": false,
+    "stun_server": "stun:stun.l.google.com:19302",
+    "signaling_server": "ws://192.168.1.220:8090"
+  },
+  "ai_detection": {
+    "enabled": false,
+    "server_ip": "192.168.1.100",
+    "server_port": 8080,
+    "model": "Custom",
+    "min_confidence": 60
+  },
+  "rth": {
+    "altitude": 56,
+    "max_height": 120,
+    "smart_rth": false,
+    "land_mode": "Land at home"
+  },
+  "camera": {
+    "iso": "Auto",
+    "shutter": "Auto",
+    "ev": "0",
+    "white_balance": "Auto"
+  },
+  "map": {
+    "type": "Normal",
+    "follow_drone": true
+  },
+  "geofence": {
+    "enabled": false,
+    "max_alt": 120,
+    "max_dist": 500,
+    "breach_action": "RTH"
+  },
+  "alerts": {
+    "low_batt_warn": 30,
+    "low_batt_crit": 15,
+    "rssi_warn": 90,
+    "lq_warn": 50
+  }
+}

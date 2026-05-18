@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Walle GCS (MAX)
+GenericName=Drone Ground Control Station
+Comment=Walle Drone Ground Control Station — MAX edition (bigger AI models)
+Exec="/home/ndrone/Downloads/Drone Development/Drone Development/rosetta/walle_gcs/walle-gcs-max"
+Path=/home/ndrone/Downloads/Drone Development/Drone Development/rosetta
+Icon=applications-engineering
+Terminal=true
+Categories=Utility;Science;
