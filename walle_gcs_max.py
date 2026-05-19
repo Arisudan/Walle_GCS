@@ -610,6 +610,26 @@ class ObjectDetectionEngine(QObject):
 
         self.depth_variant = depth_variant
 
+        # ── Overlay tuning (less-cluttered rendering) ──
+        # Cap how many boxes get drawn per frame. None = no cap (depth-only).
+        self.max_drawn = None
+        # IoU threshold for suppressing duplicate same-class boxes.
+        # Set >= 1.0 to disable — keep every same-class instance visible.
+        self.iou_dedupe_thresh = 1.0
+        # Hide detections farther than this (meters, from Depth Anything V2).
+        # None disables the cutoff. Detections with no depth info are kept.
+        self.max_distance_m = 6.0
+        # Also drop boxes that fall in the far end of THIS frame's relative
+        # depth: 0.0 keeps everything, 1.0 keeps only the absolute closest.
+        # Robust to depth_scale drift since it uses in-frame ranking.
+        self.rel_depth_drop_quantile = 0.35
+        # Optional whitelist of class names; None means "show all".
+        # Default to classes that actually matter for drone safety/ops.
+        self.class_filter = {
+            "person", "car", "truck", "bus", "bicycle", "motorcycle",
+            "dog", "cat", "chair", "couch", "bed", "dining table",
+        }
+
     def load_models(self):
         """Load models in background thread. Emits models_loaded(bool) when done.
 
@@ -833,48 +853,162 @@ class ObjectDetectionEngine(QObject):
             except Exception as e:
                 print(f"[Detection] worker error: {e}", flush=True)
 
+    @staticmethod
+    def _iou(a, b):
+        ax1, ay1, ax2, ay2 = a["x1"], a["y1"], a["x2"], a["y2"]
+        bx1, by1, bx2, by2 = b["x1"], b["y1"], b["x2"], b["y2"]
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        ua = max(1, (ax2 - ax1) * (ay2 - ay1))
+        ub = max(1, (bx2 - bx1) * (by2 - by1))
+        return inter / float(ua + ub - inter)
+
+    def _filter_for_display(self, det_list):
+        """Reduce clutter: class filter, depth cutoffs, same-class IoU dedupe,
+        top-K ranking. Depth signal comes from Depth Anything V2 via the
+        per-detection distance_m the worker already computed."""
+        if not det_list:
+            return det_list
+
+        # Optional class whitelist.
+        if self.class_filter:
+            allowed = set(self.class_filter)
+            det_list = [d for d in det_list if d["class"] in allowed]
+            if not det_list:
+                return det_list
+
+        # ── Absolute depth cutoff ───────────────────────────────────────
+        # Drop anything farther than max_distance_m (meters). Detections
+        # with no depth available are kept (don't penalise them).
+        if self.max_distance_m is not None:
+            cutoff = float(self.max_distance_m)
+            det_list = [d for d in det_list
+                        if d.get("distance_m") is None
+                        or d["distance_m"] <= cutoff]
+            if not det_list:
+                return det_list
+
+        # ── Relative depth cutoff ───────────────────────────────────────
+        # Among detections we DO have depth for, drop those that fall in
+        # the far tail of THIS frame's depth distribution. Survives even
+        # if depth_scale calibration is off, since it's rank-based.
+        depths = [d["distance_m"] for d in det_list
+                  if d.get("distance_m") is not None]
+        q = float(self.rel_depth_drop_quantile or 0.0)
+        if depths and q > 0.0:
+            # Keep boxes with distance_m <= the (1 - q) quantile of depths;
+            # e.g. q=0.35 keeps the closest 65% and drops the farthest 35%.
+            far_thresh = float(np.quantile(depths, max(0.0, 1.0 - q)))
+            det_list = [d for d in det_list
+                        if d.get("distance_m") is None
+                        or d["distance_m"] <= far_thresh]
+            if not det_list:
+                return det_list
+
+        # Optional greedy NMS within each class (keep higher confidence).
+        # Disabled by default (iou_dedupe_thresh >= 1.0) so two real persons
+        # standing next to each other aren't collapsed into one.
+        if self.iou_dedupe_thresh is not None and self.iou_dedupe_thresh < 1.0:
+            by_class = {}
+            for d in det_list:
+                by_class.setdefault(d["class"], []).append(d)
+            kept = []
+            for cls_dets in by_class.values():
+                cls_dets.sort(key=lambda x: x["conf"], reverse=True)
+                survivors = []
+                for d in cls_dets:
+                    if any(self._iou(d, s) > self.iou_dedupe_thresh
+                           for s in survivors):
+                        continue
+                    survivors.append(d)
+                kept.extend(survivors)
+        else:
+            kept = list(det_list)
+
+        # Rank: danger first, then nearest distance, then highest confidence.
+        def _rank_key(d):
+            dist = d.get("distance_m")
+            dist = dist if dist is not None else 1e6
+            return (0 if d["is_danger"] else 1, dist, -d["conf"])
+
+        kept.sort(key=_rank_key)
+        if self.max_drawn is not None and len(kept) > self.max_drawn:
+            kept = kept[: self.max_drawn]
+        return kept
+
+    @staticmethod
+    def _draw_corner_box(img, x1, y1, x2, y2, color, thickness=2, frac=0.18):
+        """Draw four corner brackets instead of a full rectangle."""
+        w, h = x2 - x1, y2 - y1
+        L = max(8, int(min(w, h) * frac))
+        # top-left
+        cv2.line(img, (x1, y1), (x1 + L, y1), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x1, y1), (x1, y1 + L), color, thickness, cv2.LINE_AA)
+        # top-right
+        cv2.line(img, (x2, y1), (x2 - L, y1), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x2, y1), (x2, y1 + L), color, thickness, cv2.LINE_AA)
+        # bottom-left
+        cv2.line(img, (x1, y2), (x1 + L, y2), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x1, y2), (x1, y2 - L), color, thickness, cv2.LINE_AA)
+        # bottom-right
+        cv2.line(img, (x2, y2), (x2 - L, y2), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x2, y2), (x2, y2 - L), color, thickness, cv2.LINE_AA)
+
     def _draw_detections(self, frame, det_list):
-        """Render cached detections onto the current frame (main thread)."""
+        """Render cached detections onto the current frame (main thread).
+
+        Minimalist style: corner-bracket boxes, single compact label per box,
+        same-class IoU dedupe, and a top-K cap (danger + nearest prioritised).
+        Tuned via self.max_drawn / self.iou_dedupe_thresh / self.class_filter.
+        """
         display = frame.copy()
         h_frame = display.shape[0]
+        total_raw = len(det_list)
+        draw_list = self._filter_for_display(det_list)
 
-        for d in det_list:
+        for d in draw_list:
             x1, y1, x2, y2 = d["x1"], d["y1"], d["x2"], d["y2"]
             name = d["class"]
-            conf = d["conf"]
             dist_m = d["distance_m"]
             is_danger = d["is_danger"]
             color = DETECT_COLORS.get(name, DETECT_DEFAULT_COLOR)
+            thickness = 2 if is_danger else 1
 
-            cv2.rectangle(display, (x1, y1), (x2, y2), color,
-                          3 if is_danger else 2)
-            dist_str = f"  {dist_m:.2f}m" if dist_m is not None else ""
-            label = f"{name} {conf:.2f}{dist_str}"
-            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(display, (x1, y1 - lh - 8), (x1 + lw + 4, y1), color, -1)
-            cv2.putText(display, label, (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+            self._draw_corner_box(display, x1, y1, x2, y2, color, thickness)
 
-            if dist_m is not None:
-                dcol = ((0, 255, 0) if dist_m > 3.0
-                        else (0, 200, 255) if dist_m > 1.5
-                        else (0, 0, 255))
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                d_txt = f"{dist_m:.2f} m"
-                (dw, dh), _ = cv2.getTextSize(d_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                cv2.putText(display, d_txt, (cx - dw // 2, cy + dh // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.putText(display, d_txt, (cx - dw // 2, cy + dh // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, dcol, 2, cv2.LINE_AA)
+            # Single compact tag: "person 2.3m"   (danger gets a leading "!")
+            dist_str = f"  {dist_m:.1f}m" if dist_m is not None else ""
+            prefix = "! " if is_danger else ""
+            label = f"{prefix}{name}{dist_str}"
+            (lw, lh), _ = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            pad_x, pad_y = 4, 3
+            ty = y1 - 4 if y1 - lh - 2 * pad_y > 0 else y2 + lh + 2 * pad_y
+            tx = x1
+            # Subtle dark backplate (semi-opaque) for legibility without bulk.
+            bg_x1, bg_y1 = tx, ty - lh - pad_y
+            bg_x2, bg_y2 = tx + lw + 2 * pad_x, ty + pad_y
+            sub = display[max(0, bg_y1):max(0, bg_y2),
+                          max(0, bg_x1):max(0, bg_x2)]
+            if sub.size:
+                sub[:] = cv2.addWeighted(sub, 0.45,
+                                         np.zeros_like(sub), 0.0, 0)
+            cv2.putText(display, label, (tx + pad_x, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
         det_fps = 1000.0 / self._det_ms if self._det_ms > 0 else 0.0
-        depth_fps = 1000.0 / self._depth_ms if self._depth_ms > 0 else 0.0
-        cv2.putText(display,
-                    f"Det: {det_fps:5.1f} FPS ({self._det_ms:3.0f} ms)   "
-                    f"Depth: {depth_fps:5.1f} FPS ({self._depth_ms:3.0f} ms)   "
-                    f"Scale: {self.depth_scale:.2f}x   Objects: {len(det_list)}",
-                    (10, h_frame - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                    (0, 255, 0), 1, cv2.LINE_AA)
+        shown = len(draw_list)
+        near_str = (f"near<{self.max_distance_m:.0f}m"
+                    if self.max_distance_m is not None else "all depths")
+        footer = (f"Det {det_fps:4.1f} FPS  ·  "
+                  f"Showing {shown}/{total_raw}  ·  {near_str}")
+        cv2.putText(display, footer, (10, h_frame - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (200, 200, 200), 1, cv2.LINE_AA)
         return display
 
     def get_depth_map(self):
