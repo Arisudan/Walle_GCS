@@ -606,6 +606,25 @@ class ObjectDetectionEngine(QObject):
         self._det_thread = None
         self._latest_detections = []
 
+        # ── Lightweight IoU tracker ──
+        # Assigns a stable id per physical object so the detection table can
+        # log each object once (with a "times seen" count) instead of adding a
+        # new row every frame. Touched only by the detection worker thread.
+        self._tracks = {}            # id -> {class, x1,y1,x2,y2, last_seen, hits}
+        self._next_track_id = 1
+        self._track_iou_thresh = 0.3
+        self._track_ttl = 2.0        # seconds unseen before a track is dropped
+
+        # ── DeepSort re-ID tracker (preferred over the IoU tracker) ──
+        # Adds a MobileNet appearance embedding + Kalman motion so an object
+        # keeps its id through short occlusions and re-entry at a different
+        # position. Created in load_models(); stays None if the package is
+        # missing, in which case the IoU tracker above is used as fallback.
+        self._deepsort = None
+        self._ds_max_age = 120       # detection-frames a track survives unseen
+        self._ds_n_init = 2          # frames before a track is confirmed/logged
+        self._track_hits = {}        # track id -> times seen (the "Count" column)
+
         self.depth_variant = depth_variant
 
         # ── Overlay tuning (less-cluttered rendering) ──
@@ -662,6 +681,23 @@ class ObjectDetectionEngine(QObject):
                     model_id, torch_dtype=torch.float16
                 ).to(self._device)
                 self._depth_model.eval()
+
+                # ── Object re-ID tracker: DeepSort + MobileNet appearance ──
+                try:
+                    from deep_sort_realtime.deepsort_tracker import DeepSort
+                    self._deepsort = DeepSort(
+                        max_age=self._ds_max_age,
+                        n_init=self._ds_n_init,
+                        max_iou_distance=0.70,
+                        nn_budget=100,
+                        embedder="mobilenet",
+                        half=(self._device.type == "cuda"),
+                    )
+                    print("[Detection] DeepSort re-ID tracker ready", flush=True)
+                except Exception as e:
+                    self._deepsort = None
+                    print(f"[Detection] DeepSort unavailable, IoU tracker used: {e}",
+                          flush=True)
 
                 # Start depth worker thread
                 self._depth_thread = threading.Thread(target=self._depth_worker, daemon=True)
@@ -848,11 +884,100 @@ class ObjectDetectionEngine(QObject):
                     if k not in seen_keys:
                         del self._dist_history[k]
 
+                # Assign stable ids: DeepSort (appearance re-id, survives
+                # occlusion) when available, else the lightweight IoU tracker.
+                if self._deepsort is not None:
+                    self._assign_deepsort_ids(new_dets, frame)
+                else:
+                    self._assign_track_ids(new_dets, time.time())
+
                 with self._lock:
                     self._latest_detections = new_dets
                     self._det_ms = det_ms
             except Exception as e:
                 print(f"[Detection] worker error: {e}", flush=True)
+
+    def _assign_deepsort_ids(self, new_dets, frame):
+        """Run DeepSort (Kalman motion + MobileNet appearance embedding) so each
+        object keeps a stable id across short occlusions and position jumps.
+
+        Mutates each det in-place adding 'id' and 'count'. Detections whose
+        track is still tentative (not confirmed yet) get no id, so the caller
+        skips logging them — that avoids duplicate rows during track warm-up.
+        """
+        ds_input = [([d["x1"], d["y1"], d["x2"] - d["x1"], d["y2"] - d["y1"]],
+                     d["conf"], d["class"]) for d in new_dets]
+        try:
+            tracks = self._deepsort.update_tracks(ds_input, frame=frame)
+        except Exception as e:
+            print(f"[Detection] DeepSort update failed: {e}", flush=True)
+            return
+
+        # Confirmed tracks updated this frame, as boxes we can match to dets.
+        confirmed = []
+        for tr in tracks:
+            if not tr.is_confirmed() or getattr(tr, "time_since_update", 0) != 0:
+                continue
+            l, t, r, b = tr.to_ltrb()
+            confirmed.append((tr.track_id, {"x1": l, "y1": t, "x2": r, "y2": b}))
+
+        used = set()
+        for d in new_dets:
+            best_tid, best_iou = None, 0.3
+            for tid, box in confirmed:
+                if tid in used:
+                    continue
+                iou = self._iou(d, box)
+                if iou >= best_iou:
+                    best_iou, best_tid = iou, tid
+            if best_tid is None:
+                continue   # tentative track -> don't log this object yet
+            used.add(best_tid)
+            self._track_hits[best_tid] = self._track_hits.get(best_tid, 0) + 1
+            try:
+                d["id"] = int(best_tid)
+            except (ValueError, TypeError):
+                d["id"] = best_tid
+            d["count"] = self._track_hits[best_tid]
+
+    def _assign_track_ids(self, new_dets, now):
+        """Match this frame's detections to existing tracks by class + IoU so
+        each physical object keeps one stable id across frames. Unmatched
+        detections get a fresh id; tracks unseen for _track_ttl seconds expire.
+
+        Mutates each det in-place, adding 'id' (int) and 'count' (how many
+        detection frames this object has appeared in so far).
+        """
+        # Expire stale tracks
+        for tid in list(self._tracks.keys()):
+            if now - self._tracks[tid]["last_seen"] > self._track_ttl:
+                del self._tracks[tid]
+
+        used = set()
+        for d in new_dets:
+            best_id, best_iou = None, self._track_iou_thresh
+            for tid, tr in self._tracks.items():
+                if tid in used or tr["class"] != d["class"]:
+                    continue
+                iou = self._iou(d, tr)
+                if iou >= best_iou:
+                    best_iou, best_id = iou, tid
+
+            if best_id is None:
+                best_id = self._next_track_id
+                self._next_track_id += 1
+                self._tracks[best_id] = {
+                    "class": d["class"], "x1": d["x1"], "y1": d["y1"],
+                    "x2": d["x2"], "y2": d["y2"], "last_seen": now, "hits": 0,
+                }
+
+            tr = self._tracks[best_id]
+            tr.update(x1=d["x1"], y1=d["y1"], x2=d["x2"], y2=d["y2"],
+                      last_seen=now)
+            tr["hits"] += 1
+            used.add(best_id)
+            d["id"] = best_id
+            d["count"] = tr["hits"]
 
     @staticmethod
     def _iou(a, b):
@@ -2208,7 +2333,16 @@ class DetectionFeedTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.events = []
+        self._event_by_id = {}   # track id -> its row dict (one row per object)
+        self._dirty = False
         self._build_ui()
+        # Coalesce frequent detection updates into a timer so per-frame, per-
+        # object add_event() calls don't flood the GUI thread (rebuilding the
+        # whole table hundreds of times/sec can drop the Qt/Wayland connection).
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(150)
+        self._refresh_timer.timeout.connect(self._refresh_if_dirty)
+        self._refresh_timer.start()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -2285,12 +2419,14 @@ class DetectionFeedTab(QWidget):
 
         # ── Event table ──
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["Time", "Type", "Label", "Confidence", "Severity", "Details"])
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels(["ID", "Time", "Type", "Label", "Confidence", "Count", "Severity", "Details"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -2344,18 +2480,42 @@ class DetectionFeedTab(QWidget):
         if label:
             label.setText(str(value))
 
-    def add_event(self, event_type, label, confidence, details="", severity="Low"):
-        timestamp = datetime.now()
-        self.events.append({
-            "time": timestamp,
-            "type": event_type,
-            "label": label,
-            "confidence": confidence,
-            "details": details,
-            "severity": severity,
-        })
-        self._apply_filters()
-        self._update_stats()
+    def add_event(self, event_type, label, confidence, details="", severity="Low",
+                  obj_id=None, count=1):
+        # One row per tracked object: if we've already logged this id, refresh
+        # its row (last-seen time, count, best confidence, latest details)
+        # instead of appending a duplicate. obj_id=None falls back to the old
+        # append-everything behaviour.
+        if obj_id is not None and obj_id in self._event_by_id:
+            ev = self._event_by_id[obj_id]
+            ev["time"] = datetime.now()
+            ev["count"] = count
+            ev["confidence"] = max(ev["confidence"], confidence)
+            ev["details"] = details
+            ev["severity"] = severity
+        else:
+            ev = {
+                "id": obj_id,
+                "time": datetime.now(),
+                "type": event_type,
+                "label": label,
+                "confidence": confidence,
+                "count": count,
+                "details": details,
+                "severity": severity,
+            }
+            self.events.append(ev)
+            if obj_id is not None:
+                self._event_by_id[obj_id] = ev
+        # Coalesced refresh: mark dirty; the timer repaints a few times/sec
+        # instead of rebuilding the whole table on every single detection.
+        self._dirty = True
+
+    def _refresh_if_dirty(self):
+        if self._dirty:
+            self._dirty = False
+            self._apply_filters()
+            self._update_stats()
 
     def _update_stats(self):
         total = len(self.events)
@@ -2400,27 +2560,31 @@ class DetectionFeedTab(QWidget):
 
         self.table.setRowCount(len(filtered))
         for i, ev in enumerate(reversed(filtered)):
-            self.table.setItem(i, 0, QTableWidgetItem(ev["time"].strftime("%H:%M:%S")))
+            id_str = str(ev["id"]) if ev.get("id") is not None else "-"
+            self.table.setItem(i, 0, QTableWidgetItem(id_str))
+            self.table.setItem(i, 1, QTableWidgetItem(ev["time"].strftime("%H:%M:%S")))
 
             type_item = QTableWidgetItem(ev["type"])
             type_colors = {"Object": "#6688ff", "Identity": "#cc88ff", "Obstacle": "#ff8844"}
             type_item.setForeground(QColor(type_colors.get(ev["type"], "#ccc")))
-            self.table.setItem(i, 1, type_item)
+            self.table.setItem(i, 2, type_item)
 
-            self.table.setItem(i, 2, QTableWidgetItem(ev["label"]))
+            self.table.setItem(i, 3, QTableWidgetItem(ev["label"]))
 
             conf_item = QTableWidgetItem(f"{ev['confidence']}%")
             conf_color = QColor(0, 200, 0) if ev["confidence"] > 80 else QColor(200, 200, 0) if ev["confidence"] > 50 else QColor(200, 100, 0)
             conf_item.setForeground(conf_color)
-            self.table.setItem(i, 3, conf_item)
+            self.table.setItem(i, 4, conf_item)
+
+            self.table.setItem(i, 5, QTableWidgetItem(f"x{ev.get('count', 1)}"))
 
             sev = ev.get("severity", "Low")
             sev_item = QTableWidgetItem(sev)
             sev_colors = {"Critical": "#ff3333", "High": "#ff8844", "Medium": "#cccc00", "Low": "#00cc00"}
             sev_item.setForeground(QColor(sev_colors.get(sev, "#888")))
-            self.table.setItem(i, 4, sev_item)
+            self.table.setItem(i, 6, sev_item)
 
-            self.table.setItem(i, 5, QTableWidgetItem(ev.get("details", "")))
+            self.table.setItem(i, 7, QTableWidgetItem(ev.get("details", "")))
 
         self.event_count.setText(f"{len(filtered)} events")
 
@@ -2429,17 +2593,20 @@ class DetectionFeedTab(QWidget):
         if path:
             with open(path, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Time", "Type", "Label", "Confidence", "Severity", "Details"])
+                writer.writerow(["ID", "Time", "Type", "Label", "Confidence", "Count", "Severity", "Details"])
                 for ev in self.events:
                     writer.writerow([
+                        ev.get("id", ""),
                         ev["time"].strftime("%Y-%m-%d %H:%M:%S"),
                         ev["type"], ev["label"], ev["confidence"],
+                        ev.get("count", 1),
                         ev.get("severity", "Low"), ev.get("details", "")
                     ])
             QMessageBox.information(self, "Export", f"Exported {len(self.events)} events to {path}")
 
     def _clear_events(self):
         self.events.clear()
+        self._event_by_id.clear()
         self.table.setRowCount(0)
         self.event_count.setText("0 events")
         self._update_stats()
@@ -4062,12 +4229,15 @@ class MainWindow(QMainWindow):
             # Feed detection events to DetectionFeedTab
             if det_list and hasattr(self, 'detection_tab'):
                 for det in det_list:
+                    if det.get("id") is None:
+                        continue   # tracker hasn't confirmed this object yet
                     evt_type = "Obstacle" if det["is_danger"] else "Object"
                     dist_str = f"{det['distance_m']:.2f}m" if det["distance_m"] else ""
                     severity = "High" if det["is_danger"] else "Low"
                     self.detection_tab.add_event(
-                        evt_type, det["class"], det["conf"],
-                        details=dist_str, severity=severity)
+                        evt_type, det["class"], round(det["conf"] * 100),
+                        details=dist_str, severity=severity,
+                        obj_id=det["id"], count=det.get("count", 1))
 
         # Depth side-by-side: original left, colorized depth right
         if self.depth_overlay_enabled and self.detect_engine.is_ready:
