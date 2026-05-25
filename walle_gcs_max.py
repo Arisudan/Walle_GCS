@@ -25,7 +25,8 @@ import hashlib
 # Wayland compositor crashes on Pop!_OS 24.04 under sustained NVIDIA driver
 # load (heavy ONNX/CUDA inference). XCB is the rock-solid X11 path.
 # Set BEFORE any PyQt5 import. ``setdefault`` so an explicit env var still wins.
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+if sys.platform != "win32":
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 from datetime import datetime, timedelta
 from collections import deque
 
@@ -1158,7 +1159,13 @@ class VideoCapture(QThread):
 
     def run(self):
         self.running = True
-        cap = cv2.VideoCapture(self.device_index, cv2.CAP_ANY)
+        if sys.platform == "win32":
+            # Try MSMF first (best for HDMI capture cards), fall back to DSHOW
+            cap = cv2.VideoCapture(self.device_index, cv2.CAP_MSMF)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(self.device_index, cv2.CAP_ANY)
         if not cap.isOpened():
             print(f"[CameraThread] Cannot open camera {self.device_index}.")
             return
@@ -4068,9 +4075,19 @@ class MainWindow(QMainWindow):
 
     def _populate_video_devices(self):
         self.video_combo.clear()
-        for i in range(10):
-            if os.path.exists(f"/dev/video{i}"):
-                self.video_combo.addItem(f"/dev/video{i}", i)
+        if sys.platform == "win32":
+            # Probe MSMF first (handles HDMI capture cards), fall back to DSHOW
+            for i in range(10):
+                cap = cv2.VideoCapture(i, cv2.CAP_MSMF)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    self.video_combo.addItem(f"Camera {i}", i)
+                    cap.release()
+        else:
+            for i in range(10):
+                if os.path.exists(f"/dev/video{i}"):
+                    self.video_combo.addItem(f"/dev/video{i}", i)
 
     def _populate_serial_ports(self):
         self.serial_combo.clear()

@@ -5,3 +5,6 @@ __pycache__/
 
 # Model weights (large binaries — keep out of git)
 *.pth
+venv/
+.pt
+*.pt

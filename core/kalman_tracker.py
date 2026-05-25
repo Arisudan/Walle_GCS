@@ -62,8 +62,8 @@ class KalmanTracker:
         P_bak = self.kf.P.copy()
 
         # Extract live velocity + acceleration
-        vx, vy = float(self.kf.x[2]), float(self.kf.x[3])
-        ax, ay = float(self.kf.x[4]), float(self.kf.x[5])
+        vx, vy = float(self.kf.x[2, 0]), float(self.kf.x[3, 0])
+        ax, ay = float(self.kf.x[4, 0]), float(self.kf.x[5, 0])
 
         arc_scale  = 1.0
         gravity    = np.zeros(2)
