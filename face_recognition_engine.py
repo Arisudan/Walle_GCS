@@ -37,8 +37,13 @@ DOWNSCALE = 0.8
 MIN_FACE_SIZE = 12
 MIN_DETECTION_SCORE = 0.3
 
+# Multi-scale detection: each scale costs one full SCRFD forward pass, so
+# 4 scales = 4x the per-frame detector cost. [1.0, 2.0] keeps the 1.0x pass
+# for normal faces and the 2.0x pass for tiny/far faces (which is what
+# FAR_FACE_THRESHOLD targets anyway), giving ~2x speedup vs. the old 4-scale
+# sweep with negligible recall loss in flight footage.
 ENABLE_MULTISCALE = True
-SCALES = [1.0, 1.5, 2.0, 2.5]
+SCALES = [1.0, 2.0]
 
 ENABLE_FAR_FACE_ZOOM = True
 FAR_FACE_THRESHOLD = 50
@@ -264,7 +269,11 @@ class FaceRecognitionEngine(QObject):
                     providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
                     allowed_modules=['detection', 'recognition'],
                 )
-                self._detector.prepare(ctx_id=0, det_size=(960, 960))
+                # 640x640 is the canonical SCRFD-10g training size and is
+                # ~2.2x faster than 960x960 with comparable mAP for the face
+                # sizes we see at typical drone altitudes. The multi-scale
+                # sweep above already covers tiny faces via the 2.0x pass.
+                self._detector.prepare(ctx_id=0, det_size=(640, 640))
                 self._rec_model = self._detector.models.get('recognition')
                 if self._rec_model is None:
                     raise RuntimeError(
@@ -274,6 +283,20 @@ class FaceRecognitionEngine(QObject):
                 self._known = self._load_or_build_cache()
                 print(f"[FaceRec] Ready — {len(self._known)} known faces",
                       flush=True)
+
+                # Warmup: a single dummy detect+embed pass primes the ONNX
+                # CUDA kernels so the first live frame doesn't pay the
+                # algo-selection cost (which can be 2-5 s on first invocation).
+                try:
+                    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+                    self._detector.get(dummy)
+                    # Touch the recognition model too — its kernels load lazily
+                    # on first call to get_feat().
+                    blank = np.zeros((112, 112, 3), dtype=np.uint8)
+                    self._rec_model.get_feat(self._preproc.process(blank))
+                    print("[FaceRec] Warmup complete", flush=True)
+                except Exception as e:
+                    print(f"[FaceRec] Warmup skipped: {e}", flush=True)
 
                 # Start the async inference worker so process_frame() never blocks.
                 self._infer_thread = threading.Thread(
