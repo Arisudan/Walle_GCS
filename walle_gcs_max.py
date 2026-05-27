@@ -3776,6 +3776,52 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._read_initial_state()
         self._start_timers()
+        # Kick off model loads in the background so toggles find engines
+        # already warm. Two important constraints:
+        #   1) Defer past the first GUI paint — heavy CUDA work during
+        #      window construction crashed the Wayland compositor on
+        #      Pop!_OS 24.04 + NVIDIA in earlier testing.
+        #   2) Chain sequentially (detect first, then face-rec). Running
+        #      both loads in parallel doubled the GPU pressure spike and
+        #      reproduced the same compositor crash.
+        # Opt out by setting WALLE_NO_PRELOAD=1.
+        if os.environ.get("WALLE_NO_PRELOAD", "0") != "1":
+            QTimer.singleShot(3000, self._preload_detect_then_facerec)
+
+    def _preload_detect_then_facerec(self):
+        """Load detect engine first; chain face-rec onto its completion signal
+        so we never have two heavy model loads running at the same time."""
+        def _start_facerec(_success):
+            try:
+                self.face_rec_engine.models_loaded.disconnect(_start_facerec)
+            except TypeError:
+                pass
+            try:
+                self.detect_engine.models_loaded.disconnect(_start_facerec)
+            except TypeError:
+                pass
+            try:
+                self.face_rec_engine.load_models()
+            except Exception as e:
+                print(f"[MainWindow] face-rec preload failed: {e}", flush=True)
+        try:
+            # QueuedConnection so the slot lands on the main thread regardless
+            # of which thread emits — emit fires from the load thread but we
+            # want all signal handling pinned to main.
+            self.detect_engine.models_loaded.connect(
+                _start_facerec, Qt.QueuedConnection)
+            self.detect_engine.load_models()
+            # If detect somehow already loaded (e.g. a prior toggle click),
+            # trigger the face-rec chain manually.
+            if self.detect_engine.is_ready:
+                QTimer.singleShot(0, lambda: _start_facerec(True))
+        except Exception as e:
+            print(f"[MainWindow] detect preload failed: {e}", flush=True)
+            # Detect failed; still preload face-rec so at least one is warm.
+            try:
+                self.face_rec_engine.load_models()
+            except Exception as e2:
+                print(f"[MainWindow] face-rec preload failed: {e2}", flush=True)
 
     def _init_pygame(self):
         pygame.init()
@@ -4551,33 +4597,42 @@ class MainWindow(QMainWindow):
 
     def _toggle_detection(self, checked):
         if checked:
-            if not self.detect_engine.is_ready:
-                self.detect_btn.setText("Loading...")
-                self.detect_btn.setEnabled(False)
-                self.toast.show_message("Loading detection models...", "#00ccff", 5000)
-
-                def on_loaded(success):
-                    self.detect_btn.setEnabled(True)
-                    if success:
-                        self.detect_enabled = True
-                        self.detect_btn.setText("Detect ON")
-                        self.toast.show_message("Detection enabled - RF-DETR + Depth", "#00ccff", 3000)
-                    else:
-                        self.detect_enabled = False
-                        self.detect_btn.setChecked(False)
-                        self.detect_btn.setText("Detect")
-                        self.toast.show_message("Detection model load failed!", "#ff3333", 3000)
-
-                try:
-                    self.detect_engine.models_loaded.disconnect()
-                except TypeError:
-                    pass
-                self.detect_engine.models_loaded.connect(on_loaded)
-                self.detect_engine.load_models()
-            else:
+            if self.detect_engine.is_ready:
                 self.detect_enabled = True
                 self.detect_btn.setText("Detect ON")
                 self.toast.show_message("Detection enabled", "#00ccff", 2000)
+                return
+            self.detect_btn.setText("Loading...")
+            self.detect_btn.setEnabled(False)
+            self.toast.show_message("Loading detection models...", "#00ccff", 5000)
+
+            def on_loaded(success):
+                self.detect_btn.setEnabled(True)
+                if success:
+                    self.detect_enabled = True
+                    self.detect_btn.setText("Detect ON")
+                    self.toast.show_message("Detection enabled - RF-DETR + Depth", "#00ccff", 3000)
+                else:
+                    self.detect_enabled = False
+                    self.detect_btn.setChecked(False)
+                    self.detect_btn.setText("Detect")
+                    self.toast.show_message("Detection model load failed!", "#ff3333", 3000)
+
+            try:
+                self.detect_engine.models_loaded.disconnect()
+            except TypeError:
+                pass
+            # QueuedConnection is critical: emit fires from the load thread,
+            # but on_loaded touches QWidgets which must run on the main
+            # thread. Default AutoConnection picks DirectConnection for
+            # plain Python callables and silently drops the UI updates.
+            self.detect_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
+            self.detect_engine.load_models()
+            # Cover the race where load finished between the is_ready check
+            # and the connect — in which case the signal already fired and
+            # on_loaded would never trigger. Queue it on the main thread.
+            if self.detect_engine.is_ready:
+                QTimer.singleShot(0, lambda: on_loaded(True))
         else:
             self.detect_enabled = False
             self.detect_btn.setText("Detect")
@@ -4585,34 +4640,35 @@ class MainWindow(QMainWindow):
 
     def _toggle_depth_overlay(self, checked):
         if checked:
-            if not self.detect_engine.is_ready:
-                # Need detection engine loaded for depth maps
-                self.depth_btn.setText("Loading...")
-                self.depth_btn.setEnabled(False)
-                self.toast.show_message("Loading depth model...", "#ff8800", 5000)
-
-                def on_loaded(success):
-                    self.depth_btn.setEnabled(True)
-                    if success:
-                        self.depth_overlay_enabled = True
-                        self.depth_btn.setText("Depth ON")
-                        self.toast.show_message("Depth overlay enabled", "#ff8800", 3000)
-                    else:
-                        self.depth_overlay_enabled = False
-                        self.depth_btn.setChecked(False)
-                        self.depth_btn.setText("Depth")
-                        self.toast.show_message("Depth model load failed!", "#ff3333", 3000)
-
-                try:
-                    self.detect_engine.models_loaded.disconnect()
-                except TypeError:
-                    pass
-                self.detect_engine.models_loaded.connect(on_loaded)
-                self.detect_engine.load_models()
-            else:
+            if self.detect_engine.is_ready:
                 self.depth_overlay_enabled = True
                 self.depth_btn.setText("Depth ON")
                 self.toast.show_message("Depth overlay enabled", "#ff8800", 2000)
+                return
+            self.depth_btn.setText("Loading...")
+            self.depth_btn.setEnabled(False)
+            self.toast.show_message("Loading depth model...", "#ff8800", 5000)
+
+            def on_loaded(success):
+                self.depth_btn.setEnabled(True)
+                if success:
+                    self.depth_overlay_enabled = True
+                    self.depth_btn.setText("Depth ON")
+                    self.toast.show_message("Depth overlay enabled", "#ff8800", 3000)
+                else:
+                    self.depth_overlay_enabled = False
+                    self.depth_btn.setChecked(False)
+                    self.depth_btn.setText("Depth")
+                    self.toast.show_message("Depth model load failed!", "#ff3333", 3000)
+
+            try:
+                self.detect_engine.models_loaded.disconnect()
+            except TypeError:
+                pass
+            self.detect_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
+            self.detect_engine.load_models()
+            if self.detect_engine.is_ready:
+                QTimer.singleShot(0, lambda: on_loaded(True))
         else:
             self.depth_overlay_enabled = False
             self.depth_btn.setText("Depth")
@@ -4621,40 +4677,42 @@ class MainWindow(QMainWindow):
 
     def _toggle_face_rec(self, checked):
         if checked:
-            if not self.face_rec_engine.is_ready:
-                self.face_btn.setText("Loading...")
-                self.face_btn.setEnabled(False)
-                self.toast.show_message(
-                    "Loading face recognition models...", "#ffd000", 6000)
-
-                def on_loaded(success):
-                    self.face_btn.setEnabled(True)
-                    if success:
-                        self.face_rec_enabled = True
-                        n = self.face_rec_engine.known_count
-                        self.face_btn.setText("Face Rec ON")
-                        self.toast.show_message(
-                            f"Face recognition enabled — {n} known faces",
-                            "#ffd000", 3000)
-                    else:
-                        self.face_rec_enabled = False
-                        self.face_btn.setChecked(False)
-                        self.face_btn.setText("Face Rec")
-                        self.toast.show_message(
-                            "Face Rec load failed (see terminal)",
-                            "#ff3333", 4000)
-
-                try:
-                    self.face_rec_engine.models_loaded.disconnect()
-                except TypeError:
-                    pass
-                self.face_rec_engine.models_loaded.connect(on_loaded)
-                self.face_rec_engine.load_models()
-            else:
+            if self.face_rec_engine.is_ready:
                 self.face_rec_enabled = True
                 self.face_btn.setText("Face Rec ON")
                 self.toast.show_message("Face recognition enabled",
                                         "#ffd000", 2000)
+                return
+            self.face_btn.setText("Loading...")
+            self.face_btn.setEnabled(False)
+            self.toast.show_message(
+                "Loading face recognition models...", "#ffd000", 6000)
+
+            def on_loaded(success):
+                self.face_btn.setEnabled(True)
+                if success:
+                    self.face_rec_enabled = True
+                    n = self.face_rec_engine.known_count
+                    self.face_btn.setText("Face Rec ON")
+                    self.toast.show_message(
+                        f"Face recognition enabled — {n} known faces",
+                        "#ffd000", 3000)
+                else:
+                    self.face_rec_enabled = False
+                    self.face_btn.setChecked(False)
+                    self.face_btn.setText("Face Rec")
+                    self.toast.show_message(
+                        "Face Rec load failed (see terminal)",
+                        "#ff3333", 4000)
+
+            try:
+                self.face_rec_engine.models_loaded.disconnect()
+            except TypeError:
+                pass
+            self.face_rec_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
+            self.face_rec_engine.load_models()
+            if self.face_rec_engine.is_ready:
+                QTimer.singleShot(0, lambda: on_loaded(True))
         else:
             self.face_rec_enabled = False
             self.face_btn.setText("Face Rec")
@@ -4663,40 +4721,42 @@ class MainWindow(QMainWindow):
 
     def _toggle_track_human(self, checked):
         if checked:
-            if not self.track_engine.is_ready:
-                self.track_btn.setText("Loading...")
-                self.track_btn.setEnabled(False)
-                self.toast.show_message(
-                    "Loading human tracker (YOLOv8-pose + DeepSort)...",
-                    "#ff66cc", 6000)
-
-                def on_loaded(success):
-                    self.track_btn.setEnabled(True)
-                    if success:
-                        self.track_enabled = True
-                        self.track_btn.setText("Track ON")
-                        self.toast.show_message(
-                            "Human tracking enabled — predictive arcs live",
-                            "#ff66cc", 3000)
-                    else:
-                        self.track_enabled = False
-                        self.track_btn.setChecked(False)
-                        self.track_btn.setText("Track")
-                        self.toast.show_message(
-                            "Human tracker load failed (see terminal)",
-                            "#ff3333", 4000)
-
-                try:
-                    self.track_engine.models_loaded.disconnect()
-                except TypeError:
-                    pass
-                self.track_engine.models_loaded.connect(on_loaded)
-                self.track_engine.load_models()
-            else:
+            if self.track_engine.is_ready:
                 self.track_enabled = True
                 self.track_btn.setText("Track ON")
                 self.toast.show_message("Human tracking enabled",
                                         "#ff66cc", 2000)
+                return
+            self.track_btn.setText("Loading...")
+            self.track_btn.setEnabled(False)
+            self.toast.show_message(
+                "Loading human tracker (YOLOv8-pose + DeepSort)...",
+                "#ff66cc", 6000)
+
+            def on_loaded(success):
+                self.track_btn.setEnabled(True)
+                if success:
+                    self.track_enabled = True
+                    self.track_btn.setText("Track ON")
+                    self.toast.show_message(
+                        "Human tracking enabled — predictive arcs live",
+                        "#ff66cc", 3000)
+                else:
+                    self.track_enabled = False
+                    self.track_btn.setChecked(False)
+                    self.track_btn.setText("Track")
+                    self.toast.show_message(
+                        "Human tracker load failed (see terminal)",
+                        "#ff3333", 4000)
+
+            try:
+                self.track_engine.models_loaded.disconnect()
+            except TypeError:
+                pass
+            self.track_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
+            self.track_engine.load_models()
+            if self.track_engine.is_ready:
+                QTimer.singleShot(0, lambda: on_loaded(True))
         else:
             self.track_enabled = False
             self.track_btn.setText("Track")
