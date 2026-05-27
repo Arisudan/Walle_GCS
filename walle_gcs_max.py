@@ -50,6 +50,9 @@ if _ROOT not in sys.path:
 
 from config.walle_max_config import load_config, get_config
 from core.logging import configure_logging, get_logger
+from core.health import (
+    EngineHealth, EngineStatus, EngineWatchdog, get_registry as get_health_registry,
+)
 
 # Load typed config FIRST so subsequent module-level constants
 # (STOP_DEPTH_REL etc.) see JSON overrides. Bad config aborts startup —
@@ -621,6 +624,14 @@ class ObjectDetectionEngine(QObject):
         self._loaded = False
         self._loading = False
         self._lock = threading.Lock()
+
+        # Health tracking — registered with the global registry so the
+        # status panel and watchdog see both workers.
+        self._depth_health = EngineHealth("Depth")
+        self._detect_health = EngineHealth("Detection")
+        _hreg = get_health_registry()
+        _hreg.register(self._depth_health)
+        _hreg.register(self._detect_health)
         self._det_model = None
         self._depth_processor = None
         self._depth_model = None
@@ -695,6 +706,8 @@ class ObjectDetectionEngine(QObject):
         if self._loaded or self._loading:
             return
         self._loading = True
+        self._depth_health.set_status(EngineStatus.LOADING)
+        self._detect_health.set_status(EngineStatus.LOADING)
 
         def _load():
             try:
@@ -764,11 +777,15 @@ class ObjectDetectionEngine(QObject):
 
                 self._loaded = True
                 self._loading = False
+                self._depth_health.set_status(EngineStatus.READY)
+                self._detect_health.set_status(EngineStatus.READY)
                 log_det.info("Models loaded OK")
                 self.models_loaded.emit(True)
             except Exception as e:
                 log_det.exception("Load failed: %s", e)
                 self._loading = False
+                self._depth_health.set_status(EngineStatus.FAILED)
+                self._detect_health.set_status(EngineStatus.FAILED)
                 self.models_loaded.emit(False)
 
         threading.Thread(target=_load, daemon=True).start()
@@ -781,13 +798,22 @@ class ObjectDetectionEngine(QObject):
         while not self._depth_stop.is_set():
             self._depth_pending.wait(timeout=0.5)
             self._depth_pending.clear()
+            # Heartbeat even when no frame is available so the watchdog
+            # doesn't misread an idle worker as a stalled one.
+            self._depth_health.heartbeat()
             with self._lock:
                 frame = self._depth_frame
             if frame is None:
                 continue
             t0 = time.perf_counter()
-            depth = self._predict_depth(frame)
+            try:
+                depth = self._predict_depth(frame)
+            except Exception as e:
+                log_det.error("depth worker error: %s", e)
+                self._depth_health.set_status(EngineStatus.DEGRADED)
+                continue
             ms = (time.perf_counter() - t0) * 1000
+            self._depth_health.record_inference(ms)
             with self._lock:
                 self._depth_map = depth
                 self._depth_ms = ms
@@ -913,6 +939,7 @@ class ObjectDetectionEngine(QObject):
         while not self._det_stop.is_set():
             self._det_pending.wait(timeout=0.5)
             self._det_pending.clear()
+            self._detect_health.heartbeat()
 
             with self._lock:
                 frame = self._det_input_frame
@@ -995,8 +1022,10 @@ class ObjectDetectionEngine(QObject):
                 with self._lock:
                     self._latest_detections = new_dets
                     self._det_ms = det_ms
+                self._detect_health.record_inference(det_ms)
             except Exception as e:
                 log_det.error("worker error: %s", e)
+                self._detect_health.set_status(EngineStatus.DEGRADED)
 
     def _assign_deepsort_ids(self, new_dets, frame):
         """Run DeepSort (Kalman motion + MobileNet appearance embedding) so each
@@ -3832,6 +3861,12 @@ class MainWindow(QMainWindow):
         # Opt out by setting WALLE_NO_PRELOAD=1.
         if os.environ.get("WALLE_NO_PRELOAD", "0") != "1":
             QTimer.singleShot(3000, self._preload_detect_then_facerec)
+
+        # Start the engine watchdog. Polls every 2 s and flags any engine
+        # that hasn't heartbeat for 5 s — surfaces silent worker-thread
+        # deaths the UI would otherwise miss.
+        self._watchdog = EngineWatchdog(get_health_registry(), poll_s=2.0)
+        self._watchdog.start()
 
     def _preload_detect_then_facerec(self):
         """Load detect engine first; chain face-rec onto its completion signal

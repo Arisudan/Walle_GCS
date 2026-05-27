@@ -21,6 +21,7 @@ import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from core.logging import get_logger
+from core.health import EngineHealth, EngineStatus, get_registry as get_health_registry
 
 log = get_logger("FaceRec")
 
@@ -217,6 +218,10 @@ class FaceRecognitionEngine(QObject):
         self._zoom = _FarFaceZoom()
         self._preproc = _Preproc()
 
+        # Health tracking
+        self._health = EngineHealth("FaceRec")
+        get_health_registry().register(self._health)
+
         # Shared state — accessed from both worker thread and GUI thread.
         self._lock = threading.Lock()
         self._tracks = {}
@@ -254,6 +259,7 @@ class FaceRecognitionEngine(QObject):
         if self._loaded or self._loading:
             return
         self._loading = True
+        self._health.set_status(EngineStatus.LOADING)
 
         def _run():
             try:
@@ -308,10 +314,12 @@ class FaceRecognitionEngine(QObject):
 
                 self._loaded = True
                 self._loading = False
+                self._health.set_status(EngineStatus.READY)
                 self.models_loaded.emit(True)
             except Exception as e:
                 log.exception("Load failed: %s", e)
                 self._loading = False
+                self._health.set_status(EngineStatus.FAILED)
                 self.models_loaded.emit(False)
 
         threading.Thread(target=_run, daemon=True).start()
@@ -406,12 +414,17 @@ class FaceRecognitionEngine(QObject):
             if (self._frame_idx % FRAME_SKIP) != 0:
                 continue
 
+            self._health.heartbeat()
             t0 = time.perf_counter()
             try:
                 self._run_detection(frame)
+                ms = (time.perf_counter() - t0) * 1000
+                self._health.record_inference(ms)
+                self._last_proc_ms = ms
             except Exception as e:
                 log.error("worker error: %s", e)
-            self._last_proc_ms = (time.perf_counter() - t0) * 1000
+                self._health.set_status(EngineStatus.DEGRADED)
+                self._last_proc_ms = (time.perf_counter() - t0) * 1000
 
             # Drop stale tracks under lock so _draw can iterate safely.
             with self._lock:

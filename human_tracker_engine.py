@@ -21,6 +21,7 @@ import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from core.logging import get_logger
+from core.health import EngineHealth, EngineStatus, get_registry as get_health_registry
 
 log = get_logger("HumanTrack")
 
@@ -87,6 +88,10 @@ class HumanTrackerEngine(QObject):
             'peak_tracks': 0,
         }
 
+        # Health tracking
+        self._health = EngineHealth("HumanTrack")
+        get_health_registry().register(self._health)
+
     @property
     def is_ready(self):
         return self._loaded
@@ -96,6 +101,7 @@ class HumanTrackerEngine(QObject):
         if self._loaded or self._loading:
             return
         self._loading = True
+        self._health.set_status(EngineStatus.LOADING)
 
         def _run():
             try:
@@ -150,11 +156,13 @@ class HumanTrackerEngine(QObject):
 
                 self._loaded = True
                 self._loading = False
+                self._health.set_status(EngineStatus.READY)
                 log.info("Ready")
                 self.models_loaded.emit(True)
             except Exception as e:
                 log.exception("Load failed: %s", e)
                 self._loading = False
+                self._health.set_status(EngineStatus.FAILED)
                 self.models_loaded.emit(False)
 
         threading.Thread(target=_run, daemon=True).start()
@@ -175,6 +183,7 @@ class HumanTrackerEngine(QObject):
         while not self._infer_stop.is_set():
             self._infer_pending.wait(timeout=0.5)
             self._infer_pending.clear()
+            self._health.heartbeat()
 
             with self._lock:
                 frame = self._infer_input_frame
@@ -262,9 +271,12 @@ class HumanTrackerEngine(QObject):
                     if len(all_ids) > self._stats['peak_tracks']:
                         self._stats['peak_tracks'] = len(all_ids)
 
-                self._last_proc_ms = (time.perf_counter() - t0) * 1000
+                ms = (time.perf_counter() - t0) * 1000
+                self._last_proc_ms = ms
+                self._health.record_inference(ms)
             except Exception as e:
                 log.error("worker error: %s", e)
+                self._health.set_status(EngineStatus.DEGRADED)
 
     def _get_keypoints_for_bbox(self, results, bbox):
         if not hasattr(results, "keypoints") or results.keypoints is None:
