@@ -1465,6 +1465,12 @@ class VideoFeedWidget(QLabel):
         self.aspect_w = 16
         self.aspect_h = 9
 
+        # HUD overlay cache: rebuilt at 10 Hz regardless of video framerate
+        self._hud_overlay = None
+        self._hud_overlay_size = (0, 0)
+        self._hud_last_paint_ms = 0
+        self._hud_interval_ms = 100
+
     def set_aspect_ratio(self, w, h):
         self.aspect_w = w
         self.aspect_h = h
@@ -1493,17 +1499,34 @@ class VideoFeedWidget(QLabel):
             target_h = lh
             target_w = int(lh * self.aspect_w / self.aspect_h)
 
-        pixmap = QPixmap.fromImage(img).scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pixmap = QPixmap.fromImage(img).scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation)
 
         if self.hud_visible:
-            pixmap = self._paint_hud(pixmap)
+            self._composite_hud(pixmap)
 
         self.setPixmap(pixmap)
 
-    def _paint_hud(self, pixmap):
+    def _composite_hud(self, pixmap):
+        # HUD overlay is cached and only rebuilt every _hud_interval_ms (10 Hz)
+        # so per-frame video stays smooth even though the HUD itself paints
+        # 40+ QPainter primitives.
+        now_ms = int(time.monotonic() * 1000)
+        size_now = (pixmap.width(), pixmap.height())
+        if (self._hud_overlay is None
+                or self._hud_overlay_size != size_now
+                or (now_ms - self._hud_last_paint_ms) >= self._hud_interval_ms):
+            self._hud_overlay = self._build_hud_overlay(*size_now)
+            self._hud_overlay_size = size_now
+            self._hud_last_paint_ms = now_ms
         p = QPainter(pixmap)
+        p.drawPixmap(0, 0, self._hud_overlay)
+        p.end()
+
+    def _build_hud_overlay(self, pw, ph):
+        overlay = QPixmap(pw, ph)
+        overlay.fill(Qt.transparent)
+        p = QPainter(overlay)
         p.setRenderHint(QPainter.Antialiasing)
-        pw, ph = pixmap.width(), pixmap.height()
 
         hud_bg = QColor(0, 0, 0, 150)
         hud_font = QFont("Segoe UI", 10, QFont.Bold)
@@ -1620,7 +1643,7 @@ class VideoFeedWidget(QLabel):
             p.drawText(pw - dl_w + 2, 28, depth_label)
 
         p.end()
-        return pixmap
+        return overlay
 
     def _draw_artificial_horizon(self, p, pw, ph):
         """Draw a compact artificial horizon indicator at screen center."""
@@ -2419,7 +2442,9 @@ class DetectionFeedTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.events = []
+        # Bounded ring buffer: prevents the filter/stats pass from growing O(N)
+        # unbounded over hours of operation. Older events drop off the left.
+        self.events = deque(maxlen=5000)
         self._event_by_id = {}   # track id -> its row dict (one row per object)
         self._dirty = False
         self._build_ui()
