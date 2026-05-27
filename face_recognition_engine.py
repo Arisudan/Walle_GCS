@@ -20,6 +20,10 @@ import cv2
 import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 
+from core.logging import get_logger
+
+log = get_logger("FaceRec")
+
 
 # ─── Config ─────────────────────────────────────────────────────────
 # buffalo_l ships SCRFD-10g detector + ResNet50 ArcFace recognition,
@@ -258,8 +262,8 @@ class FaceRecognitionEngine(QObject):
                 from insightface.utils import face_align
                 self._face_align = face_align
 
-                print(f"[FaceRec] Initializing {DETECTOR_NAME} (SCRFD + ArcFace ONNX) ...",
-                      flush=True)
+                log.info("Initializing %s (SCRFD + ArcFace ONNX) ...",
+                         DETECTOR_NAME)
                 # Only load the two ONNX models we actually use. The default
                 # FaceAnalysis bundle also pulls in landmark_2d_106, 1k3d68,
                 # and genderage — they cost ~150 MB VRAM and add GPU contention
@@ -279,10 +283,9 @@ class FaceRecognitionEngine(QObject):
                     raise RuntimeError(
                         f"{DETECTOR_NAME} did not load a recognition model")
 
-                print("[FaceRec] Loading known-faces cache ...", flush=True)
+                log.info("Loading known-faces cache ...")
                 self._known = self._load_or_build_cache()
-                print(f"[FaceRec] Ready — {len(self._known)} known faces",
-                      flush=True)
+                log.info("Ready — %d known faces", len(self._known))
 
                 # Warmup: a single dummy detect+embed pass primes the ONNX
                 # CUDA kernels so the first live frame doesn't pay the
@@ -294,9 +297,9 @@ class FaceRecognitionEngine(QObject):
                     # on first call to get_feat().
                     blank = np.zeros((112, 112, 3), dtype=np.uint8)
                     self._rec_model.get_feat(self._preproc.process(blank))
-                    print("[FaceRec] Warmup complete", flush=True)
+                    log.info("Warmup complete")
                 except Exception as e:
-                    print(f"[FaceRec] Warmup skipped: {e}", flush=True)
+                    log.warning("Warmup skipped: %s", e)
 
                 # Start the async inference worker so process_frame() never blocks.
                 self._infer_thread = threading.Thread(
@@ -307,7 +310,7 @@ class FaceRecognitionEngine(QObject):
                 self._loading = False
                 self.models_loaded.emit(True)
             except Exception as e:
-                print(f"[FaceRec] Load failed: {e}", flush=True)
+                log.exception("Load failed: %s", e)
                 self._loading = False
                 self.models_loaded.emit(False)
 
@@ -319,8 +322,7 @@ class FaceRecognitionEngine(QObject):
                 with open(EMBEDDING_CACHE_FILE, "rb") as f:
                     return pickle.load(f)
             except Exception as e:
-                print(f"[FaceRec] Cache load failed ({e}); rebuilding",
-                      flush=True)
+                log.warning("Cache load failed (%s); rebuilding", e)
         return self._build_cache()
 
     def _build_cache(self):
@@ -337,22 +339,22 @@ class FaceRecognitionEngine(QObject):
             try:
                 faces = self._detector.get(img)
                 if not faces:
-                    print(f"[FaceRec]   {f}: no face found", flush=True)
+                    log.warning("  %s: no face found", f)
                     continue
                 face = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
                 aligned = self._face_align.norm_crop(img, face.kps)
                 pre = self._preproc.process(aligned)
                 emb = np.asarray(self._rec_model.get_feat(pre)).flatten()
                 cache[os.path.splitext(f)[0]] = emb
-                print(f"[FaceRec]   {f} OK", flush=True)
+                log.info("  %s OK", f)
             except Exception as e:
-                print(f"[FaceRec]   {f} FAILED: {e}", flush=True)
+                log.error("  %s FAILED: %s", f, e)
         if cache:
             try:
                 with open(EMBEDDING_CACHE_FILE, "wb") as f:
                     pickle.dump(cache, f)
             except Exception as e:
-                print(f"[FaceRec] Could not save cache: {e}", flush=True)
+                log.error("Could not save cache: %s", e)
         return cache
 
     # ── Matching ──────────────────────────────────────────────────
@@ -408,7 +410,7 @@ class FaceRecognitionEngine(QObject):
             try:
                 self._run_detection(frame)
             except Exception as e:
-                print(f"[FaceRec] worker error: {e}", flush=True)
+                log.error("worker error: %s", e)
             self._last_proc_ms = (time.perf_counter() - t0) * 1000
 
             # Drop stale tracks under lock so _draw can iterate safely.
@@ -523,7 +525,7 @@ class FaceRecognitionEngine(QObject):
                     name, sim = self._match(emb)
                     tr.update_embed(emb, name, sim, self._frame_num, zoomed)
                 except Exception as e:
-                    print(f"[FaceRec] embed error: {e}", flush=True)
+                    log.error("embed error: %s", e)
             else:
                 self._stats['embeddings_cached'] += 1
 

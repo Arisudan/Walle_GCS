@@ -20,6 +20,10 @@ import cv2
 import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 
+from core.logging import get_logger
+
+log = get_logger("HumanTrack")
+
 # Make the existing tracker package importable. Its sub-modules use absolute
 # imports rooted at ``config``, ``core``, ``ui`` — they only resolve when the
 # tracker root is on sys.path.
@@ -104,13 +108,13 @@ class HumanTrackerEngine(QObject):
                 from ui.visualizer import Visualizer
 
                 self._device = "cuda" if torch.cuda.is_available() else "cpu"
-                print(f"[HumanTrack] Device: {self._device}", flush=True)
+                log.info("Device: %s", self._device)
 
                 # Force pose variant — keypoints feed the motion classifier
                 mp = self._model_path
                 if "pose" not in mp:
                     mp = mp.replace(".pt", "-pose.pt")
-                print(f"[HumanTrack] Loading {mp} ...", flush=True)
+                log.info("Loading %s ...", mp)
                 self._model = YOLO(mp)
                 self._model.to(self._device)
 
@@ -124,8 +128,7 @@ class HumanTrackerEngine(QObject):
                     DISPLAY_LIVE=False,
                 )
 
-                print("[HumanTrack] Initializing DeepSort + predictor ...",
-                      flush=True)
+                log.info("Initializing DeepSort + predictor ...")
                 self._deepsort = DeepSort(
                     max_age=self._cfg.MAX_AGE,
                     n_init=self._cfg.N_INIT,
@@ -147,12 +150,10 @@ class HumanTrackerEngine(QObject):
 
                 self._loaded = True
                 self._loading = False
-                print("[HumanTrack] Ready", flush=True)
+                log.info("Ready")
                 self.models_loaded.emit(True)
             except Exception as e:
-                import traceback
-                print(f"[HumanTrack] Load failed: {e}\n{traceback.format_exc()}",
-                      flush=True)
+                log.exception("Load failed: %s", e)
                 self._loading = False
                 self.models_loaded.emit(False)
 
@@ -263,7 +264,7 @@ class HumanTrackerEngine(QObject):
 
                 self._last_proc_ms = (time.perf_counter() - t0) * 1000
             except Exception as e:
-                print(f"[HumanTrack] worker error: {e}", flush=True)
+                log.error("worker error: %s", e)
 
     def _get_keypoints_for_bbox(self, results, bbox):
         if not hasattr(results, "keypoints") or results.keypoints is None:

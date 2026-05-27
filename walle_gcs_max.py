@@ -48,10 +48,20 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.append(_ROOT)
 
+from core.logging import configure_logging, get_logger
 from face_recognition_engine import FaceRecognitionEngine
 from human_tracker_engine import HumanTrackerEngine
 from slam_engine import SlamEngine, SlamTab
 from reconstruction_engine import ReconstructionTab
+
+log_crsf = get_logger("CRSF")
+log_serial = get_logger("Serial")
+log_det = get_logger("Detection")
+log_cam = get_logger("CameraThread")
+log_esp = get_logger("ESP32")
+log_joy = get_logger("Joystick")
+log_main = get_logger("MainWindow")
+log_settings = get_logger("Settings")
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QGroupBox, QGridLayout, QFrame,
@@ -327,7 +337,7 @@ class CRSFTelemetry:
                 self._logged_types = set()
             if frame_type not in self._logged_types:
                 self._logged_types.add(frame_type)
-                print(f"[CRSF] Unknown frame type=0x{frame_type:02X}, len={len(payload)}, payload={bytes(payload).hex()}")
+                log_crsf.debug("Unknown frame type=0x%02X len=%d payload=%s", frame_type, len(payload), bytes(payload).hex())
 
 
 class SerialReader(QThread):
@@ -385,7 +395,7 @@ class SerialReader(QThread):
         best_baud = None
         best_frames = 0
 
-        print(f"[Serial] Probing {self.port_name} …")
+        log_serial.info("Probing %s …", self.port_name)
         for baud in baud_rates:
             try:
                 test_ser = serial.Serial(self.port_name, baud, timeout=1.5)
@@ -397,16 +407,16 @@ class SerialReader(QThread):
                 n_frames = self._count_crsf_frames(test_data) if test_data else 0
 
                 if n_frames > 0:
-                    print(f"[Serial] {baud} baud: {n_bytes} bytes, {n_frames} CRSF frame(s) ✓")
+                    log_serial.info("%d baud: %d bytes, %d CRSF frame(s) ✓", baud, n_bytes, n_frames)
                     if n_frames > best_frames:
                         best_baud = baud
                         best_frames = n_frames
                 elif test_data:
                     has_sync = any(b in (CRSF_SYNC_BYTE, CRSF_SYNC_BYTE_TX) for b in test_data)
-                    print(f"[Serial] {baud} baud: {n_bytes} bytes, sync={'yes' if has_sync else 'no'}, 0 frames")
-                    print(f"[Serial]   raw: {test_data[:48].hex()}")
+                    log_serial.info("%d baud: %d bytes, sync=%s, 0 frames", baud, n_bytes, "yes" if has_sync else "no")
+                    log_serial.debug("  raw: %s", test_data[:48].hex())
                 else:
-                    print(f"[Serial] {baud} baud: no data")
+                    log_serial.info("%d baud: no data", baud)
 
                 test_ser.close()
 
@@ -414,20 +424,20 @@ class SerialReader(QThread):
                 if best_frames >= 3:
                     break
             except Exception as e:
-                print(f"[Serial] {baud} baud failed: {e}")
+                log_serial.warning("%d baud failed: %s", baud, e)
 
         # Use best baud found, or fall back to user-specified
         chosen_baud = best_baud or self.baud
         if best_baud:
-            print(f"[Serial] Using {chosen_baud} baud ({best_frames} CRSF frames detected)")
+            log_serial.info("Using %d baud (%d CRSF frames detected)", chosen_baud, best_frames)
         else:
-            print(f"[Serial] No CRSF detected — opening at {chosen_baud} baud anyway")
+            log_serial.warning("No CRSF detected — opening at %d baud anyway", chosen_baud)
 
         try:
             ser = serial.Serial(self.port_name, chosen_baud, timeout=0.1)
             ser.reset_input_buffer()
         except Exception as e:
-            print(f"[Serial] Failed to open port: {e}")
+            log_serial.error("Failed to open port: %s", e)
             return
 
         try:
@@ -439,7 +449,7 @@ class SerialReader(QThread):
                 if not data:
                     no_data_count += 1
                     if no_data_count == 50:  # ~5 seconds of silence
-                        print(f"[Serial] Warning: no data from {self.port_name} for ~5s")
+                        log_serial.warning("No data from %s for ~5s", self.port_name)
                     continue
                 no_data_count = 0
                 buf.extend(data)
@@ -448,7 +458,7 @@ class SerialReader(QThread):
                     idx = self._find_sync(buf)
                     if idx < 0:
                         if frame_count == 0 and len(buf) > 0:
-                            print(f"[Serial] No sync in {len(buf)} bytes. Raw: {buf[:48].hex()}")
+                            log_serial.warning("No sync in %d bytes. Raw: %s", len(buf), buf[:48].hex())
                         buf.clear()
                         break
                     if idx > 0:
@@ -469,14 +479,14 @@ class SerialReader(QThread):
                     self.telemetry_updated.emit(self.telemetry)
                     frame_count += 1
                     if frame_count <= 20:
-                        print(f"[Serial] Frame #{frame_count}: type=0x{frame_type:02X}, len={frame_len}")
+                        log_serial.debug("Frame #%d: type=0x%02X, len=%d", frame_count, frame_type, frame_len)
                     if frame_count == 21:
-                        print(f"[Serial] Got {frame_count} frames, suppressing logs …")
+                        log_serial.info("Got %d frames, suppressing logs …", frame_count)
                     buf = buf[total_len:]
 
             ser.close()
         except Exception as e:
-            print(f"[Serial] Error: {e}")
+            log_serial.error("Error: %s", e)
             if ser and ser.is_open:
                 ser.close()
 
@@ -676,9 +686,9 @@ class ObjectDetectionEngine(QObject):
         def _load():
             try:
                 self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                print(f"[Detection] Device: {self._device}")
+                log_det.info("Device: %s", self._device)
 
-                print("[Detection] Loading RF-DETR Medium (MAX) ...", flush=True)
+                log_det.info("Loading RF-DETR Medium (MAX) ...")
                 self._det_model = RFDETRMedium()
                 # torch.compile (TorchInductor) gives ~1.5-2x steady-state
                 # speedup but triggers heavy GPU kernel compilation that can
@@ -691,14 +701,12 @@ class ObjectDetectionEngine(QObject):
                         compile=_use_compile, dtype=torch.float16
                     )
                     tag = "fp16, compiled" if _use_compile else "fp16"
-                    print(f"[Detection] RF-DETR optimized for inference ({tag})",
-                          flush=True)
+                    log_det.info("RF-DETR optimized for inference (%s)", tag)
                 except Exception as e:
-                    print(f"[Detection] optimize_for_inference skipped: {e}",
-                          flush=True)
+                    log_det.warning("optimize_for_inference skipped: %s", e)
 
                 model_id = DEPTH_MODELS[self.depth_variant]
-                print(f"[Detection] Loading depth model: {model_id}")
+                log_det.info("Loading depth model: %s", model_id)
                 self._depth_processor = AutoImageProcessor.from_pretrained(model_id)
                 self._depth_model = AutoModelForDepthEstimation.from_pretrained(
                     model_id, torch_dtype=torch.float16
@@ -717,11 +725,10 @@ class ObjectDetectionEngine(QObject):
                         embedder="mobilenet",
                         half=(self._device.type == "cuda"),
                     )
-                    print("[Detection] DeepSort re-ID tracker ready", flush=True)
+                    log_det.info("DeepSort re-ID tracker ready")
                 except Exception as e:
                     self._deepsort = None
-                    print(f"[Detection] DeepSort unavailable, IoU tracker used: {e}",
-                          flush=True)
+                    log_det.warning("DeepSort unavailable, IoU tracker used: %s", e)
 
                 # Warmup pass: a single dummy forward through each model to
                 # absorb cuDNN algo-selection and torch.compile graph capture
@@ -729,9 +736,9 @@ class ObjectDetectionEngine(QObject):
                 # toggle-on click can take 10-30 s to produce its first box.
                 try:
                     self._warmup()
-                    print("[Detection] Warmup complete", flush=True)
+                    log_det.info("Warmup complete")
                 except Exception as e:
-                    print(f"[Detection] Warmup skipped: {e}", flush=True)
+                    log_det.warning("Warmup skipped: %s", e)
 
                 # Start depth worker thread
                 self._depth_thread = threading.Thread(target=self._depth_worker, daemon=True)
@@ -744,10 +751,10 @@ class ObjectDetectionEngine(QObject):
 
                 self._loaded = True
                 self._loading = False
-                print("[Detection] Models loaded OK")
+                log_det.info("Models loaded OK")
                 self.models_loaded.emit(True)
             except Exception as e:
-                print(f"[Detection] Load failed: {e}")
+                log_det.exception("Load failed: %s", e)
                 self._loading = False
                 self.models_loaded.emit(False)
 
@@ -825,12 +832,12 @@ class ObjectDetectionEngine(QObject):
         try:
             _ = self._predict_depth(dummy)
         except Exception as e:
-            print(f"[Detection] depth warmup error: {e}", flush=True)
+            log_det.error("depth warmup error: %s", e)
         # Detection warmup — RF-DETR.predict accepts a BGR ndarray.
         try:
             _ = self._det_model.predict(dummy, threshold=self.conf_thresh)
         except Exception as e:
-            print(f"[Detection] detect warmup error: {e}", flush=True)
+            log_det.error("detect warmup error: %s", e)
 
     def _sample_depth(self, depth_map, x1, y1, x2, y2):
         h, w = depth_map.shape
@@ -976,7 +983,7 @@ class ObjectDetectionEngine(QObject):
                     self._latest_detections = new_dets
                     self._det_ms = det_ms
             except Exception as e:
-                print(f"[Detection] worker error: {e}", flush=True)
+                log_det.error("worker error: %s", e)
 
     def _assign_deepsort_ids(self, new_dets, frame):
         """Run DeepSort (Kalman motion + MobileNet appearance embedding) so each
@@ -991,7 +998,7 @@ class ObjectDetectionEngine(QObject):
         try:
             tracks = self._deepsort.update_tracks(ds_input, frame=frame)
         except Exception as e:
-            print(f"[Detection] DeepSort update failed: {e}", flush=True)
+            log_det.error("DeepSort update failed: %s", e)
             return
 
         # Confirmed tracks updated this frame, as boxes we can match to dets.
@@ -1248,7 +1255,7 @@ class VideoCapture(QThread):
         else:
             cap = cv2.VideoCapture(self.device_index, cv2.CAP_ANY)
         if not cap.isOpened():
-            print(f"[CameraThread] Cannot open camera {self.device_index}.")
+            log_cam.error("Cannot open camera %s.", self.device_index)
             return
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         while self.running:
@@ -3508,7 +3515,7 @@ class SettingsTab(QWidget):
             self.lq_warn.setValue(a.get("lq_warn", 50))
 
         except Exception as e:
-            print(f"Failed to load settings: {e}")
+            log_settings.error("Failed to load settings: %s", e)
 
 
 # ─── User Credentials Store ──────────────────────────────────────────
@@ -3828,7 +3835,7 @@ class MainWindow(QMainWindow):
             try:
                 self.face_rec_engine.load_models()
             except Exception as e:
-                print(f"[MainWindow] face-rec preload failed: {e}", flush=True)
+                log_main.error("face-rec preload failed: %s", e)
         try:
             # QueuedConnection so the slot lands on the main thread regardless
             # of which thread emits — emit fires from the load thread but we
@@ -3841,12 +3848,12 @@ class MainWindow(QMainWindow):
             if self.detect_engine.is_ready:
                 QTimer.singleShot(0, lambda: _start_facerec(True))
         except Exception as e:
-            print(f"[MainWindow] detect preload failed: {e}", flush=True)
+            log_main.error("detect preload failed: %s", e)
             # Detect failed; still preload face-rec so at least one is warm.
             try:
                 self.face_rec_engine.load_models()
             except Exception as e2:
-                print(f"[MainWindow] face-rec preload failed: {e2}", flush=True)
+                log_main.error("face-rec preload failed: %s", e2)
 
     def _init_pygame(self):
         pygame.init()
@@ -4309,11 +4316,11 @@ class MainWindow(QMainWindow):
                     self.esp32_serial = serial.Serial(port, 115200, timeout=0.1)
                     self.esp32_btn.setText("Unlink")
                     self.toast.show_message(f"ESP32 linked: {port}", "#00cc00", 2000)
-                    print(f"[ESP32] Connected to {port}")
+                    log_esp.info("Connected to %s", port)
                 except Exception as e:
                     self.esp32_btn.setChecked(False)
                     self.toast.show_message(f"ESP32 failed: {e}", "#ff3333", 3000)
-                    print(f"[ESP32] Error: {e}")
+                    log_esp.error("%s", e)
             else:
                 self.esp32_btn.setChecked(False)
         else:
@@ -4333,7 +4340,7 @@ class MainWindow(QMainWindow):
             cmd = f"{ch[0]},{ch[1]},{ch[2]},{ch[3]},{ch[4]}\n"
             self.esp32_serial.write(cmd.encode())
         except Exception as e:
-            print(f"[ESP32] Write error: {e}")
+            log_esp.error("Write error: %s", e)
             try:
                 self.esp32_serial.close()
             except Exception:
@@ -4799,10 +4806,10 @@ class MainWindow(QMainWindow):
         pygame.event.pump()
         num_axes = self.joystick.get_numaxes()
         num_buttons = self.joystick.get_numbuttons()
-        print(f"[Joystick] {self.joystick.get_name()}: {num_axes} axes, {num_buttons} buttons")
+        log_joy.info("%s: %d axes, %d buttons", self.joystick.get_name(), num_axes, num_buttons)
         for i in range(num_axes):
             val = self.joystick.get_axis(i)
-            print(f"  Axis {i}: {val:+.3f}")
+            log_joy.debug("  Axis %d: %+.3f", i, val)
 
         # Arm state now derived from CRSF flight mode telemetry (VCP), not joystick
         self.control_tab.set_armed(self.armed)
@@ -4914,6 +4921,8 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    log_path = configure_logging()
+    log_main.info("walle_gcs_max starting (log: %s)", log_path)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
