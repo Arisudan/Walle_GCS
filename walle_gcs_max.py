@@ -48,7 +48,14 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.append(_ROOT)
 
+from config.walle_max_config import load_config, get_config
 from core.logging import configure_logging, get_logger
+
+# Load typed config FIRST so subsequent module-level constants
+# (STOP_DEPTH_REL etc.) see JSON overrides. Bad config aborts startup —
+# loud failure beats silently flying on stale thresholds.
+WALLE_CONFIG = load_config()
+
 from face_recognition_engine import FaceRecognitionEngine
 from human_tracker_engine import HumanTrackerEngine
 from slam_engine import SlamEngine, SlamTab
@@ -533,11 +540,17 @@ DETECT_COLORS = {
 DETECT_DEFAULT_COLOR = (255, 255, 255)
 
 # ─── Depth Avoidance (from drone_depth_avoidance.py) ────────────────
+#
+# Thresholds are pulled from the typed config at startup
+# (config/walle_max_config.py :: DepthZoneConfig). These module-level
+# names remain so the rest of the file can keep referencing
+# STOP_DEPTH_REL / SLOW_DEPTH_REL / CENTER_ZONE_FRAC without each call
+# site having to fetch the config.
 
-# Zone / threshold constants
-STOP_DEPTH_REL   = 180.0   # normalized 0..255; above this -> emergency
-SLOW_DEPTH_REL   = 140.0   # above this -> side-step
-CENTER_ZONE_FRAC = 0.34    # fraction of width that counts as "forward"
+_zone_cfg = get_config().depth_zone
+STOP_DEPTH_REL = _zone_cfg.stop_depth_rel    # normalized 0..255; above -> emergency
+SLOW_DEPTH_REL = _zone_cfg.slow_depth_rel    # above -> side-step
+CENTER_ZONE_FRAC = _zone_cfg.center_zone_frac  # fraction of width that is "forward"
 
 
 def _normalize_depth(depth_raw: np.ndarray) -> np.ndarray:
@@ -4922,7 +4935,10 @@ class MainWindow(QMainWindow):
 
 def main():
     log_path = configure_logging()
+    cfg = get_config()
     log_main.info("walle_gcs_max starting (log: %s)", log_path)
+    log_main.info("config: depth_zone=%s detection=%s",
+                  cfg.depth_zone, cfg.detection)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
