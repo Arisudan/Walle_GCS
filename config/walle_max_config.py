@@ -61,6 +61,13 @@ class DetectionConfig:
     rfdetr_compile: bool = False   # WALLE_NO_PRELOAD / RFDETR_COMPILE override
     deepsort_max_age: int = 30
     deepsort_n_init: int = 3
+    # Worker inference cadence caps. The video display always runs at
+    # camera FPS (drawing the most-recent cached result); these only
+    # bound how often the detection / depth models actually run, which is
+    # the dominant CPU cost. 0 disables the cap (run flat-out). Defaults
+    # trade a little detection latency for a large CPU reduction.
+    target_fps: float = 15.0        # detection (RF-DETR + DeepSort) worker
+    depth_target_fps: float = 10.0  # depth (Depth-Anything) worker
 
     def validate(self) -> None:
         if not (0.0 <= self.conf_thresh <= 1.0):
@@ -74,6 +81,11 @@ class DetectionConfig:
             v = getattr(self, name)
             if v <= 0:
                 raise ValueError(f"detection.{name} must be positive")
+        for name in ("target_fps", "depth_target_fps"):
+            v = getattr(self, name)
+            if not (0.0 <= v <= 240.0):
+                raise ValueError(
+                    f"detection.{name}={v} must be in [0, 240] (0 = uncapped)")
 
 
 @dataclass

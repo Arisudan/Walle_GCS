@@ -160,6 +160,10 @@ from protocol.crsf import (
 # ─── Application Version ────────────────────────────────────────────
 APP_VERSION = EDITION.version
 
+# Qt 5.14+ can wrap a BGR byte buffer directly (no per-frame BGR->RGB
+# conversion in the video hot path). Fall back gracefully on older Qt.
+_HAS_BGR888 = hasattr(QImage, "Format_BGR888")
+
 # ─── Dark Theme Stylesheet ──────────────────────────────────────────
 DARK_STYLESHEET = """
 QMainWindow { background-color: #0a0a0a; }
@@ -482,6 +486,17 @@ class ObjectDetectionEngine(QObject):
         self._det_thread = None
         self._latest_detections = []
 
+        # Worker cadence caps (see DetectionConfig.target_fps). The display
+        # still draws every camera frame from the cached result; these only
+        # limit how often the heavy models actually run — the main CPU lever.
+        _dcfg = get_config().detection
+        self._det_min_interval = (1.0 / _dcfg.target_fps
+                                  if _dcfg.target_fps > 0 else 0.0)
+        self._depth_min_interval = (1.0 / _dcfg.depth_target_fps
+                                    if _dcfg.depth_target_fps > 0 else 0.0)
+        self._last_det_proc = 0.0
+        self._last_depth_proc = 0.0
+
         # ── Lightweight IoU tracker ──
         # Assigns a stable id per physical object so the detection table can
         # log each object once (with a "times seen" count) instead of adding a
@@ -628,6 +643,13 @@ class ObjectDetectionEngine(QObject):
             # Heartbeat even when no frame is available so the watchdog
             # doesn't misread an idle worker as a stalled one.
             self._depth_health.heartbeat()
+            # Cadence cap (see _detection_worker). Depth is the heaviest
+            # model; capping it to depth_target_fps is the biggest CPU win.
+            if self._depth_min_interval:
+                now = time.perf_counter()
+                if (now - self._last_depth_proc) < self._depth_min_interval:
+                    continue
+                self._last_depth_proc = now
             with self._lock:
                 frame = self._depth_frame
             if frame is None:
@@ -767,6 +789,16 @@ class ObjectDetectionEngine(QObject):
             self._det_pending.wait(timeout=0.5)
             self._det_pending.clear()
             self._detect_health.heartbeat()
+
+            # Cadence cap: if we ran too recently, skip this wake. The newest
+            # frame stays cached (latest-frame-wins) and the next wake within
+            # the interval processes it; the display keeps drawing the prior
+            # result every frame, so video FPS is unaffected.
+            if self._det_min_interval:
+                now = time.perf_counter()
+                if (now - self._last_det_proc) < self._det_min_interval:
+                    continue
+                self._last_det_proc = now
 
             with self._lock:
                 frame = self._det_input_frame
@@ -1362,10 +1394,24 @@ class VideoFeedWidget(QLabel):
         self.hud_flight_mode = flight_mode
 
     def display_frame(self, frame):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        # Hot path: runs on the GUI thread at camera FPS. Feed the BGR
+        # buffer straight to QImage via Format_BGR888 (Qt 5.14+) instead of
+        # a full-frame cv2.cvtColor(BGR2RGB) every frame — that conversion
+        # is an H*W*3 op on the main thread under the GIL, and it competes
+        # with detection drawing and HUD compositing. QImage needs a
+        # C-contiguous buffer; camera frames and the stacked buffer already
+        # are, so the ascontiguousarray copy almost never fires.
+        if _HAS_BGR888:
+            if not frame.flags["C_CONTIGUOUS"]:
+                frame = np.ascontiguousarray(frame)
+            h, w, ch = frame.shape
+            bytes_per_line = ch * w
+            img = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            bytes_per_line = ch * w
+            img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
         # Calculate aspect-ratio fit within widget
         lw, lh = self.width(), self.height()

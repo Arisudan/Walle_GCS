@@ -51,7 +51,8 @@ class HumanTrackerEngine(QObject):
                  model_path: str = "yolov8n-pose.pt",
                  conf_threshold: float = 0.35,
                  predict_seconds: float = 1.0,
-                 video_fps: float = 30.0):
+                 video_fps: float = 30.0,
+                 target_fps: float = 15.0):
         super().__init__()
         self._loaded = False
         self._loading = False
@@ -62,6 +63,11 @@ class HumanTrackerEngine(QObject):
         self._conf = conf_threshold
         self._predict_seconds = predict_seconds
         self._video_fps = video_fps
+        # Inference cadence cap. process_frame()/draw still run every camera
+        # frame from the cached render; this only bounds how often YOLO-pose
+        # actually runs (the CPU cost). 0 = uncapped.
+        self._min_interval = 1.0 / target_fps if target_fps > 0 else 0.0
+        self._last_proc = 0.0
 
         # Heavy state (populated by load_models)
         self._model = None
@@ -184,6 +190,14 @@ class HumanTrackerEngine(QObject):
             self._infer_pending.wait(timeout=0.5)
             self._infer_pending.clear()
             self._health.heartbeat()
+
+            # Cadence cap: skip this wake if we ran too recently. The cached
+            # render keeps drawing every camera frame, so display is smooth.
+            if self._min_interval:
+                now = time.perf_counter()
+                if (now - self._last_proc) < self._min_interval:
+                    continue
+                self._last_proc = now
 
             with self._lock:
                 frame = self._infer_input_frame
