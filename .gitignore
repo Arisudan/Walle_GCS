@@ -2,7 +2,7 @@
 *.pyc
 __pycache__/
 *.pyc
-
+walle_gcs_max_commit_plan.docx
 # Model weights (large binaries — keep out of git)
 *.pth
 venv/

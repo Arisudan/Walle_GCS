@@ -22,4 +22,4 @@ fi
 # Run from the project root: model weights referenced by bare relative paths
 # (e.g. yolov8n-pose.pt) and the shared slam_engine.py live there.
 cd "$ROOT"
-exec "$PY" "$HERE/walle_gcs_max.py" "$@"
+exec "$PY" "$HERE/walle_gcs.py" --edition max "$@"

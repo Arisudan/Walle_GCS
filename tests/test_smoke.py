@@ -11,12 +11,13 @@ import unittest
 
 import _env  # noqa: F401  -- sets sys.path + offscreen Qt; must import first
 
-# The shipping builds and their expected version strings. After the twin-file
-# merge (Phase 1) this collapses to one module exercised with/without --max;
-# update this table at that point.
+# Post twin-file merge: one module, two editions selected by --edition.
+# EDITION is resolved from argv once at import, so a single process boots
+# the default (base) edition. That exercises all shared UI; the only
+# edition-specific code (the RF-DETR model class) loads on toggle, not at
+# MainWindow construction, so it is out of smoke scope.
 BUILDS = [
     ("walle_gcs", "2.0.0"),
-    ("walle_gcs_max", "2.0.0-MAX"),
 ]
 
 EXPECTED_TABS = ["control_tab", "detection_tab", "logs_tab",

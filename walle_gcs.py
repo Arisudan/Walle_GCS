@@ -1,12 +1,19 @@
 
 #!/usr/bin/env python3
 """
-Walle Drone Ground Control Station
-Controls and monitors a Betaflight + ELRS FPV drone via RadioMaster TX (USB)
-with DJI O4 video feed via HDMI capture card.
+Walle Drone Ground Control Station.
 
-Advanced GUI inspired by RosettaDrone — sidebar navigation, enhanced HUD,
-safety controls, AI detection feed, flight logs, and comprehensive settings.
+Single GCS application with two editions, selected at launch via
+``--edition base|max`` (default: base). The edition picks the AI model
+sizes and the config/credential files; everything else is shared:
+
+  base : RF-DETR Base   + Depth-Anything-V2 Small  (walle_settings.json,
+         walle_users.json)
+  max  : RF-DETR Medium + Depth-Anything-V2 Base   (walle_settings_max.json,
+         walle_users_max.json) — bigger models, higher accuracy.
+
+The two editions use separate config files so MAX settings never
+overwrite the regular build's. See the EDITIONS table below.
 """
 
 import sys
@@ -37,7 +44,7 @@ import serial.tools.list_ports
 import torch
 from PIL import Image as PILImage
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-from rfdetr import RFDETRBase
+from rfdetr import RFDETRBase, RFDETRMedium
 
 # This script lives in walle_gcs/. Its shared sibling module ``slam_engine``
 # (and the model/data files it expects) stay in the rosetta project root, so
@@ -46,10 +53,74 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.append(_ROOT)
 
+from config.walle_max_config import load_config, get_config
+from core.logging import configure_logging, get_logger
+from core.health import (
+    EngineHealth, EngineStatus, EngineWatchdog, get_registry as get_health_registry,
+)
+
+# ─── Edition selection ──────────────────────────────────────────────
+# One application, two editions. ``--edition`` is parsed here at import
+# time (not in main()) because WALLE_CONFIG below loads at module level,
+# before main() runs. parse_known_args ignores Qt's own argv flags.
+import argparse
+from dataclasses import dataclass as _dataclass
+from pathlib import Path as _Path
+
+
+@_dataclass(frozen=True)
+class Edition:
+    name: str
+    detect_model: type      # RF-DETR class to instantiate
+    depth_variant: str      # Depth-Anything variant key (see DEPTH_MODELS)
+    settings_file: str
+    users_file: str
+    version: str
+    title_tag: str          # suffix shown in window title / login
+
+
+EDITIONS = {
+    "base": Edition("base", RFDETRBase,   "Small",
+                    "walle_settings.json",     "walle_users.json",
+                    "2.0.0",     ""),
+    "max":  Edition("max",  RFDETRMedium, "Base",
+                    "walle_settings_max.json", "walle_users_max.json",
+                    "2.0.0-MAX", "  [MAX]"),
+}
+
+
+def _resolve_edition() -> Edition:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--edition", choices=tuple(EDITIONS), default="base")
+    args, _ = p.parse_known_args()
+    return EDITIONS[args.edition]
+
+
+EDITION = _resolve_edition()
+_HERE = _Path(__file__).resolve().parent
+
+# Load typed config FIRST so subsequent module-level constants
+# (STOP_DEPTH_REL etc.) see JSON overrides. Bad config aborts startup —
+# loud failure beats silently flying on stale thresholds. The edition
+# picks which settings file to layer over the typed defaults.
+WALLE_CONFIG = load_config(path=_HERE / EDITION.settings_file)
+# The settings file may not carry depth_variant; the edition is the
+# source of truth for which model sizes this build runs.
+WALLE_CONFIG.detection.depth_variant = EDITION.depth_variant
+
 from face_recognition_engine import FaceRecognitionEngine
 from human_tracker_engine import HumanTrackerEngine
 from slam_engine import SlamEngine, SlamTab
 from reconstruction_engine import ReconstructionTab
+
+log_crsf = get_logger("CRSF")
+log_serial = get_logger("Serial")
+log_det = get_logger("Detection")
+log_cam = get_logger("CameraThread")
+log_esp = get_logger("ESP32")
+log_joy = get_logger("Joystick")
+log_main = get_logger("MainWindow")
+log_settings = get_logger("Settings")
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QGroupBox, QGridLayout, QFrame,
@@ -72,19 +143,22 @@ from PyQt5.QtGui import (
 from PyQt5.QtCore import QPointF
 
 
-# ─── CRSF Protocol Constants ────────────────────────────────────────
-CRSF_SYNC_BYTE = 0xC8
-CRSF_SYNC_BYTE_TX = 0xEA  # TX module address (used in telem mirror)
-CRSF_FRAMETYPE_GPS = 0x02
-CRSF_FRAMETYPE_VARIO = 0x07
-CRSF_FRAMETYPE_BATTERY = 0x08
-CRSF_FRAMETYPE_LINK_STATS = 0x14
-CRSF_FRAMETYPE_RC_CHANNELS = 0x16
-CRSF_FRAMETYPE_ATTITUDE = 0x1E
-CRSF_FRAMETYPE_FLIGHT_MODE = 0x21
+# ─── CRSF Protocol — moved to protocol/crsf.py ──────────────────────
+# CRSFTelemetry, SerialReader, and the CRSF_FRAMETYPE_* constants now
+# live in protocol/crsf.py so this file isn't responsible for radio-
+# link parsing. Re-exported here under the historical names so other
+# code in this file (e.g. parse_frame() calls from tests) keeps
+# working without a churning rename.
+from protocol.crsf import (
+    CRSF_SYNC_BYTE, CRSF_SYNC_BYTE_TX,
+    CRSF_FRAMETYPE_GPS, CRSF_FRAMETYPE_VARIO, CRSF_FRAMETYPE_BATTERY,
+    CRSF_FRAMETYPE_LINK_STATS, CRSF_FRAMETYPE_RC_CHANNELS,
+    CRSF_FRAMETYPE_ATTITUDE, CRSF_FRAMETYPE_FLIGHT_MODE,
+    CRSFTelemetry, SerialReader,
+)
 
 # ─── Application Version ────────────────────────────────────────────
-APP_VERSION = "2.0.0"
+APP_VERSION = EDITION.version
 
 # ─── Dark Theme Stylesheet ──────────────────────────────────────────
 DARK_STYLESHEET = """
@@ -255,232 +329,6 @@ QToolButton:checked {
 """
 
 
-class CRSFTelemetry:
-    """Parses CRSF telemetry from RadioMaster serial port."""
-
-    def __init__(self):
-        self.battery_voltage = 0.0
-        self.battery_current = 0.0
-        self.battery_mah = 0
-        self.battery_percent = 0
-        self.rssi_1 = 0
-        self.rssi_2 = 0
-        self.link_quality = 0
-        self.snr = 0
-        self.rf_mode = 0
-        self.tx_power = 0
-        # GPS
-        self.latitude = 0.0
-        self.longitude = 0.0
-        self.ground_speed = 0.0
-        self.heading = 0.0
-        self.altitude = 0.0
-        self.satellites = 0
-        # Attitude
-        self.pitch = 0.0
-        self.roll = 0.0
-        self.yaw = 0.0
-        # Vario
-        self.vertical_speed = 0.0
-        # Flight mode
-        self.flight_mode = ""
-        # RC channels (16 channels, raw 11-bit values 172-1811, center 992)
-        self.rc_channels = [992] * 16
-
-    def parse_frame(self, frame_type, payload):
-        if frame_type == CRSF_FRAMETYPE_GPS and len(payload) >= 15:
-            self.latitude = struct.unpack(">i", payload[0:4])[0] / 1e7
-            self.longitude = struct.unpack(">i", payload[4:8])[0] / 1e7
-            self.ground_speed = struct.unpack(">H", payload[8:10])[0] / 36.0  # dm/s to m/s
-            self.heading = struct.unpack(">H", payload[10:12])[0] / 100.0
-            self.altitude = (struct.unpack(">H", payload[12:14])[0] - 1000)  # meters, offset by 1000
-            self.satellites = payload[14]
-        elif frame_type == CRSF_FRAMETYPE_BATTERY and len(payload) >= 8:
-            self.battery_voltage = struct.unpack(">H", payload[0:2])[0] / 10.0
-            self.battery_current = struct.unpack(">H", payload[2:4])[0] / 10.0
-            self.battery_mah = (payload[4] << 16 | payload[5] << 8 | payload[6])
-            self.battery_percent = payload[7]
-        elif frame_type == CRSF_FRAMETYPE_LINK_STATS and len(payload) >= 10:
-            self.rssi_1 = payload[0]
-            self.rssi_2 = payload[1]
-            self.link_quality = payload[2]
-            self.snr = struct.unpack("b", bytes([payload[3]]))[0]
-            self.rf_mode = payload[5]
-            self.tx_power = payload[6]
-        elif frame_type == CRSF_FRAMETYPE_ATTITUDE and len(payload) >= 6:
-            self.pitch = struct.unpack(">h", payload[0:2])[0] / 10000.0 * (180.0 / 3.14159)
-            self.roll = struct.unpack(">h", payload[2:4])[0] / 10000.0 * (180.0 / 3.14159)
-            self.yaw = struct.unpack(">h", payload[4:6])[0] / 10000.0 * (180.0 / 3.14159)
-        elif frame_type == CRSF_FRAMETYPE_VARIO and len(payload) >= 2:
-            self.vertical_speed = struct.unpack(">h", payload[0:2])[0] / 10.0
-        elif frame_type == CRSF_FRAMETYPE_RC_CHANNELS and len(payload) >= 22:
-            # 16 channels packed as 11-bit values in 22 bytes
-            bits = int.from_bytes(payload[:22], byteorder='little')
-            for i in range(16):
-                self.rc_channels[i] = (bits >> (i * 11)) & 0x7FF
-        elif frame_type == CRSF_FRAMETYPE_FLIGHT_MODE and len(payload) >= 1:
-            self.flight_mode = bytes(payload).split(b'\x00')[0].decode('ascii', errors='ignore')
-        else:
-            if not hasattr(self, '_logged_types'):
-                self._logged_types = set()
-            if frame_type not in self._logged_types:
-                self._logged_types.add(frame_type)
-                print(f"[CRSF] Unknown frame type=0x{frame_type:02X}, len={len(payload)}, payload={bytes(payload).hex()}")
-
-
-class SerialReader(QThread):
-    """Reads CRSF telemetry from RadioMaster serial port in background."""
-    telemetry_updated = pyqtSignal(object)
-
-    def __init__(self, port_name, baud=420000):
-        super().__init__()
-        self.port_name = port_name
-        self.baud = baud
-        self.running = False
-        self.telemetry = CRSFTelemetry()
-
-    def _find_sync(self, buf):
-        """Find first CRSF sync byte (0xC8 or 0xEA)."""
-        for i, b in enumerate(buf):
-            if b == CRSF_SYNC_BYTE or b == CRSF_SYNC_BYTE_TX:
-                return i
-        return -1
-
-    def _count_crsf_frames(self, data):
-        """Count valid CRSF frames in a data buffer."""
-        buf = bytearray(data)
-        count = 0
-        while len(buf) >= 4:
-            idx = self._find_sync(buf)
-            if idx < 0:
-                break
-            buf = buf[idx:]
-            if len(buf) < 3:
-                break
-            frame_len = buf[1]
-            if frame_len < 2 or frame_len > 62:
-                buf = buf[1:]
-                continue
-            total_len = frame_len + 2
-            if len(buf) < total_len:
-                break
-            count += 1
-            buf = buf[total_len:]
-        return count
-
-    def run(self):
-        self.running = True
-        # RadioMaster TX USB serial: EdgeTX uses 400000 or 921600 depending on
-        # version/config. ELRS passthrough uses 420000. Try all common rates.
-        baud_rates = [400000, 420000, 921600, 115200, 57600]
-        if self.baud not in baud_rates:
-            baud_rates.insert(0, self.baud)
-        elif baud_rates[0] != self.baud:
-            baud_rates.remove(self.baud)
-            baud_rates.insert(0, self.baud)
-
-        ser = None
-        best_baud = None
-        best_frames = 0
-
-        print(f"[Serial] Probing {self.port_name} …")
-        for baud in baud_rates:
-            try:
-                test_ser = serial.Serial(self.port_name, baud, timeout=1.5)
-                # Flush stale data then read fresh
-                test_ser.reset_input_buffer()
-                time.sleep(0.1)
-                test_data = test_ser.read(1024)
-                n_bytes = len(test_data)
-                n_frames = self._count_crsf_frames(test_data) if test_data else 0
-
-                if n_frames > 0:
-                    print(f"[Serial] {baud} baud: {n_bytes} bytes, {n_frames} CRSF frame(s) ✓")
-                    if n_frames > best_frames:
-                        best_baud = baud
-                        best_frames = n_frames
-                elif test_data:
-                    has_sync = any(b in (CRSF_SYNC_BYTE, CRSF_SYNC_BYTE_TX) for b in test_data)
-                    print(f"[Serial] {baud} baud: {n_bytes} bytes, sync={'yes' if has_sync else 'no'}, 0 frames")
-                    print(f"[Serial]   raw: {test_data[:48].hex()}")
-                else:
-                    print(f"[Serial] {baud} baud: no data")
-
-                test_ser.close()
-
-                # If we got good frames, no need to try more
-                if best_frames >= 3:
-                    break
-            except Exception as e:
-                print(f"[Serial] {baud} baud failed: {e}")
-
-        # Use best baud found, or fall back to user-specified
-        chosen_baud = best_baud or self.baud
-        if best_baud:
-            print(f"[Serial] Using {chosen_baud} baud ({best_frames} CRSF frames detected)")
-        else:
-            print(f"[Serial] No CRSF detected — opening at {chosen_baud} baud anyway")
-
-        try:
-            ser = serial.Serial(self.port_name, chosen_baud, timeout=0.1)
-            ser.reset_input_buffer()
-        except Exception as e:
-            print(f"[Serial] Failed to open port: {e}")
-            return
-
-        try:
-            buf = bytearray()
-            frame_count = 0
-            no_data_count = 0
-            while self.running:
-                data = ser.read(256)
-                if not data:
-                    no_data_count += 1
-                    if no_data_count == 50:  # ~5 seconds of silence
-                        print(f"[Serial] Warning: no data from {self.port_name} for ~5s")
-                    continue
-                no_data_count = 0
-                buf.extend(data)
-
-                while len(buf) >= 4:
-                    idx = self._find_sync(buf)
-                    if idx < 0:
-                        if frame_count == 0 and len(buf) > 0:
-                            print(f"[Serial] No sync in {len(buf)} bytes. Raw: {buf[:48].hex()}")
-                        buf.clear()
-                        break
-                    if idx > 0:
-                        buf = buf[idx:]
-                    if len(buf) < 3:
-                        break
-                    frame_len = buf[1]
-                    if frame_len < 2 or frame_len > 62:
-                        buf = buf[1:]
-                        continue
-                    total_len = frame_len + 2
-                    if len(buf) < total_len:
-                        break
-
-                    frame_type = buf[2]
-                    payload = buf[3:total_len - 1]
-                    self.telemetry.parse_frame(frame_type, bytes(payload))
-                    self.telemetry_updated.emit(self.telemetry)
-                    frame_count += 1
-                    if frame_count <= 20:
-                        print(f"[Serial] Frame #{frame_count}: type=0x{frame_type:02X}, len={frame_len}")
-                    if frame_count == 21:
-                        print(f"[Serial] Got {frame_count} frames, suppressing logs …")
-                    buf = buf[total_len:]
-
-            ser.close()
-        except Exception as e:
-            print(f"[Serial] Error: {e}")
-            if ser and ser.is_open:
-                ser.close()
-
-    def stop(self):
-        self.running = False
-        self.wait(2000)
 
 
 # ─── Object Detection + Depth Engine ────────────────────────────────
@@ -521,11 +369,17 @@ DETECT_COLORS = {
 DETECT_DEFAULT_COLOR = (255, 255, 255)
 
 # ─── Depth Avoidance (from drone_depth_avoidance.py) ────────────────
+#
+# Thresholds are pulled from the typed config at startup
+# (config/walle_max_config.py :: DepthZoneConfig). These module-level
+# names remain so the rest of the file can keep referencing
+# STOP_DEPTH_REL / SLOW_DEPTH_REL / CENTER_ZONE_FRAC without each call
+# site having to fetch the config.
 
-# Zone / threshold constants
-STOP_DEPTH_REL   = 180.0   # normalized 0..255; above this -> emergency
-SLOW_DEPTH_REL   = 140.0   # above this -> side-step
-CENTER_ZONE_FRAC = 0.34    # fraction of width that counts as "forward"
+_zone_cfg = get_config().depth_zone
+STOP_DEPTH_REL = _zone_cfg.stop_depth_rel    # normalized 0..255; above -> emergency
+SLOW_DEPTH_REL = _zone_cfg.slow_depth_rel    # above -> side-step
+CENTER_ZONE_FRAC = _zone_cfg.center_zone_frac  # fraction of width that is "forward"
 
 
 def _normalize_depth(depth_raw: np.ndarray) -> np.ndarray:
@@ -535,11 +389,24 @@ def _normalize_depth(depth_raw: np.ndarray) -> np.ndarray:
     return d
 
 
+# Precomputed Spectral_r LUT: built once at first use to avoid per-frame
+# matplotlib colormap lookups. cv2.applyColorMap with this LUT is ~10x faster.
+_SPECTRAL_R_LUT = None
+
+
+def _spectral_r_lut() -> np.ndarray:
+    global _SPECTRAL_R_LUT
+    if _SPECTRAL_R_LUT is None:
+        cmap = matplotlib.colormaps.get_cmap("Spectral_r")
+        rgb = np.array([cmap(i)[:3] for i in range(256)]) * 255.0
+        _SPECTRAL_R_LUT = rgb[:, ::-1].astype(np.uint8).reshape(256, 1, 3)
+    return _SPECTRAL_R_LUT
+
+
 def _colorize_depth(depth_norm: np.ndarray) -> np.ndarray:
     """Apply Spectral_r colormap to a 0-255 depth map -> BGR image."""
-    cmap = matplotlib.colormaps.get_cmap("Spectral_r")
     d8 = depth_norm.astype(np.uint8)
-    return (cmap(d8)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
+    return cv2.applyColorMap(d8, _spectral_r_lut())
 
 
 def _zone_closeness(depth_norm: np.ndarray, zone_frac: float = CENTER_ZONE_FRAC):
@@ -575,7 +442,7 @@ class ObjectDetectionEngine(QObject):
 
     models_loaded = pyqtSignal(bool)
 
-    def __init__(self, conf_thresh=0.5, depth_variant="Small", camera_pitch=-30.0):
+    def __init__(self, conf_thresh=0.5, depth_variant="Base", camera_pitch=-30.0):
         super().__init__()
         self.conf_thresh = conf_thresh
         self.camera_pitch = camera_pitch
@@ -583,6 +450,14 @@ class ObjectDetectionEngine(QObject):
         self._loaded = False
         self._loading = False
         self._lock = threading.Lock()
+
+        # Health tracking — registered with the global registry so the
+        # status panel and watchdog see both workers.
+        self._depth_health = EngineHealth("Depth")
+        self._detect_health = EngineHealth("Detection")
+        _hreg = get_health_registry()
+        _hreg.register(self._depth_health)
+        _hreg.register(self._detect_health)
         self._det_model = None
         self._depth_processor = None
         self._depth_model = None
@@ -657,31 +532,40 @@ class ObjectDetectionEngine(QObject):
         if self._loaded or self._loading:
             return
         self._loading = True
+        self._depth_health.set_status(EngineStatus.LOADING)
+        self._detect_health.set_status(EngineStatus.LOADING)
 
         def _load():
             try:
                 self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                print(f"[Detection] Device: {self._device}")
+                log_det.info("Device: %s", self._device)
 
-                print("[Detection] Loading RF-DETR Base ...", flush=True)
-                self._det_model = RFDETRBase()
+                log_det.info("Loading %s (%s edition) ...",
+                             EDITION.detect_model.__name__, EDITION.name)
+                self._det_model = EDITION.detect_model()
+                # torch.compile (TorchInductor) gives ~1.5-2x steady-state
+                # speedup but triggers heavy GPU kernel compilation that can
+                # stress the NVIDIA + Wayland compositor combo on Pop!_OS
+                # (we've seen it crash the Wayland connection on first run).
+                # Off by default; flip on via RFDETR_COMPILE=1 once verified.
+                _use_compile = os.environ.get("RFDETR_COMPILE", "0") == "1"
                 try:
                     self._det_model.optimize_for_inference(
-                        compile=False, dtype=torch.float16
+                        compile=_use_compile, dtype=torch.float16
                     )
-                    print("[Detection] RF-DETR optimized for inference (fp16)",
-                          flush=True)
+                    tag = "fp16, compiled" if _use_compile else "fp16"
+                    log_det.info("RF-DETR optimized for inference (%s)", tag)
                 except Exception as e:
-                    print(f"[Detection] optimize_for_inference skipped: {e}",
-                          flush=True)
+                    log_det.warning("optimize_for_inference skipped: %s", e)
 
                 model_id = DEPTH_MODELS[self.depth_variant]
-                print(f"[Detection] Loading depth model: {model_id}")
+                log_det.info("Loading depth model: %s", model_id)
                 self._depth_processor = AutoImageProcessor.from_pretrained(model_id)
                 self._depth_model = AutoModelForDepthEstimation.from_pretrained(
                     model_id, torch_dtype=torch.float16
                 ).to(self._device)
                 self._depth_model.eval()
+                self._cache_depth_preproc()
 
                 # ── Object re-ID tracker: DeepSort + MobileNet appearance ──
                 try:
@@ -694,11 +578,20 @@ class ObjectDetectionEngine(QObject):
                         embedder="mobilenet",
                         half=(self._device.type == "cuda"),
                     )
-                    print("[Detection] DeepSort re-ID tracker ready", flush=True)
+                    log_det.info("DeepSort re-ID tracker ready")
                 except Exception as e:
                     self._deepsort = None
-                    print(f"[Detection] DeepSort unavailable, IoU tracker used: {e}",
-                          flush=True)
+                    log_det.warning("DeepSort unavailable, IoU tracker used: %s", e)
+
+                # Warmup pass: a single dummy forward through each model to
+                # absorb cuDNN algo-selection and torch.compile graph capture
+                # before the first real frame arrives. Without this the first
+                # toggle-on click can take 10-30 s to produce its first box.
+                try:
+                    self._warmup()
+                    log_det.info("Warmup complete")
+                except Exception as e:
+                    log_det.warning("Warmup skipped: %s", e)
 
                 # Start depth worker thread
                 self._depth_thread = threading.Thread(target=self._depth_worker, daemon=True)
@@ -711,11 +604,15 @@ class ObjectDetectionEngine(QObject):
 
                 self._loaded = True
                 self._loading = False
-                print("[Detection] Models loaded OK")
+                self._depth_health.set_status(EngineStatus.READY)
+                self._detect_health.set_status(EngineStatus.READY)
+                log_det.info("Models loaded OK")
                 self.models_loaded.emit(True)
             except Exception as e:
-                print(f"[Detection] Load failed: {e}")
+                log_det.exception("Load failed: %s", e)
                 self._loading = False
+                self._depth_health.set_status(EngineStatus.FAILED)
+                self._detect_health.set_status(EngineStatus.FAILED)
                 self.models_loaded.emit(False)
 
         threading.Thread(target=_load, daemon=True).start()
@@ -728,26 +625,85 @@ class ObjectDetectionEngine(QObject):
         while not self._depth_stop.is_set():
             self._depth_pending.wait(timeout=0.5)
             self._depth_pending.clear()
+            # Heartbeat even when no frame is available so the watchdog
+            # doesn't misread an idle worker as a stalled one.
+            self._depth_health.heartbeat()
             with self._lock:
                 frame = self._depth_frame
             if frame is None:
                 continue
             t0 = time.perf_counter()
-            depth = self._predict_depth(frame)
+            try:
+                depth = self._predict_depth(frame)
+            except Exception as e:
+                log_det.error("depth worker error: %s", e)
+                self._depth_health.set_status(EngineStatus.DEGRADED)
+                continue
             ms = (time.perf_counter() - t0) * 1000
+            self._depth_health.record_inference(ms)
             with self._lock:
                 self._depth_map = depth
                 self._depth_ms = ms
 
+    def _cache_depth_preproc(self):
+        """Pull resize size + mean/std out of the HF processor once at load
+        time so per-frame inference can skip the PIL roundtrip entirely.
+
+        The HF AutoImageProcessor does its resize and normalize on CPU
+        via PIL — that single call dominates depth latency on a fast GPU.
+        Doing the same work with cv2.resize + a precomputed GPU tensor
+        cuts per-frame preproc from ~15-25 ms down to ~1-2 ms.
+        """
+        proc = self._depth_processor
+        # Depth-Anything-V2 uses DPTImageProcessor: 'size' is {'height','width'}.
+        size = getattr(proc, "size", None) or {}
+        h = size.get("height") or size.get("shortest_edge") or 518
+        w = size.get("width") or size.get("shortest_edge") or 518
+        self._depth_in_hw = (int(h), int(w))
+
+        mean = np.asarray(getattr(proc, "image_mean", [0.5, 0.5, 0.5]),
+                          dtype=np.float32)
+        std = np.asarray(getattr(proc, "image_std", [0.5, 0.5, 0.5]),
+                         dtype=np.float32)
+        rescale = float(getattr(proc, "rescale_factor", 1.0 / 255.0))
+        # Preconvert to (1, 3, 1, 1) tensors on the model device in fp16 so
+        # broadcast-normalize is a fused GPU op.
+        self._depth_mean_t = torch.from_numpy(mean).to(
+            self._device, dtype=torch.float16).view(1, 3, 1, 1)
+        self._depth_std_t = torch.from_numpy(std).to(
+            self._device, dtype=torch.float16).view(1, 3, 1, 1)
+        self._depth_rescale = rescale
+
     @torch.inference_mode()
     def _predict_depth(self, bgr_frame):
-        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        pil = PILImage.fromarray(rgb)
-        inp = self._depth_processor(images=pil, return_tensors="pt")
-        inp = {k: v.to(self._device, dtype=torch.float16) for k, v in inp.items()}
-        out = self._depth_model(**inp)
+        th, tw = self._depth_in_hw
+        # cv2 resize is much faster than PIL.Image.resize and matches HF's
+        # bilinear default closely enough for monocular depth.
+        resized = cv2.resize(bgr_frame, (tw, th), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        # HWC uint8 -> 1xCxHxW fp16 on device, normalize on GPU.
+        t = torch.from_numpy(rgb).to(self._device, non_blocking=True)
+        t = t.permute(2, 0, 1).unsqueeze(0).to(torch.float16)
+        t = t * (self._depth_rescale)  # implicit fp16 mult
+        t = (t - self._depth_mean_t) / self._depth_std_t
+        out = self._depth_model(pixel_values=t)
         depth = out.predicted_depth.squeeze().float().cpu().numpy()
         return cv2.resize(depth, (bgr_frame.shape[1], bgr_frame.shape[0]))
+
+    def _warmup(self):
+        """Run one dummy forward through both models to absorb cuDNN algo
+        selection and torch.compile graph capture before live frames arrive."""
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        # Depth warmup
+        try:
+            _ = self._predict_depth(dummy)
+        except Exception as e:
+            log_det.error("depth warmup error: %s", e)
+        # Detection warmup — RF-DETR.predict accepts a BGR ndarray.
+        try:
+            _ = self._det_model.predict(dummy, threshold=self.conf_thresh)
+        except Exception as e:
+            log_det.error("detect warmup error: %s", e)
 
     def _sample_depth(self, depth_map, x1, y1, x2, y2):
         h, w = depth_map.shape
@@ -810,6 +766,7 @@ class ObjectDetectionEngine(QObject):
         while not self._det_stop.is_set():
             self._det_pending.wait(timeout=0.5)
             self._det_pending.clear()
+            self._detect_health.heartbeat()
 
             with self._lock:
                 frame = self._det_input_frame
@@ -830,7 +787,6 @@ class ObjectDetectionEngine(QObject):
 
                 h_frame, w_frame = frame.shape[:2]
 
-                # Altitude-based depth scaling (same logic as before).
                 if depth_map is not None and altitude > 0.5:
                     ground_strip = depth_map[int(depth_map.shape[0] * 0.7):, :]
                     if ground_strip.size > 0:
@@ -863,7 +819,6 @@ class ObjectDetectionEngine(QObject):
                             dists = self._compute_distance(
                                 raw_d, altitude, pitch, obj_cy)
 
-                            # Temporal smoothing
                             gx = int(((x1 + x2) / 2.0) / w_frame * 8)
                             gy = int(obj_cy * 8)
                             skey = f"{name}_{gx}_{gy}"
@@ -880,7 +835,6 @@ class ObjectDetectionEngine(QObject):
                         "is_danger": name in DANGER_CLASSES,
                     })
 
-                # Prune stale distance history
                 for k in list(self._dist_history.keys()):
                     if k not in seen_keys:
                         del self._dist_history[k]
@@ -895,8 +849,10 @@ class ObjectDetectionEngine(QObject):
                 with self._lock:
                     self._latest_detections = new_dets
                     self._det_ms = det_ms
+                self._detect_health.record_inference(det_ms)
             except Exception as e:
-                print(f"[Detection] worker error: {e}", flush=True)
+                log_det.error("worker error: %s", e)
+                self._detect_health.set_status(EngineStatus.DEGRADED)
 
     def _assign_deepsort_ids(self, new_dets, frame):
         """Run DeepSort (Kalman motion + MobileNet appearance embedding) so each
@@ -911,7 +867,7 @@ class ObjectDetectionEngine(QObject):
         try:
             tracks = self._deepsort.update_tracks(ds_input, frame=frame)
         except Exception as e:
-            print(f"[Detection] DeepSort update failed: {e}", flush=True)
+            log_det.error("DeepSort update failed: %s", e)
             return
 
         # Confirmed tracks updated this frame, as boxes we can match to dets.
@@ -1161,13 +1117,14 @@ class VideoCapture(QThread):
     def run(self):
         self.running = True
         if sys.platform == "win32":
+            # Try MSMF first (best for HDMI capture cards), fall back to DSHOW
             cap = cv2.VideoCapture(self.device_index, cv2.CAP_MSMF)
             if not cap.isOpened():
                 cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
         else:
             cap = cv2.VideoCapture(self.device_index, cv2.CAP_ANY)
         if not cap.isOpened():
-            print(f"[CameraThread] Cannot open camera {self.device_index}.")
+            log_cam.error("Cannot open camera %s.", self.device_index)
             return
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         while self.running:
@@ -1384,6 +1341,12 @@ class VideoFeedWidget(QLabel):
         self.aspect_w = 16
         self.aspect_h = 9
 
+        # HUD overlay cache: rebuilt at 10 Hz regardless of video framerate
+        self._hud_overlay = None
+        self._hud_overlay_size = (0, 0)
+        self._hud_last_paint_ms = 0
+        self._hud_interval_ms = 100
+
     def set_aspect_ratio(self, w, h):
         self.aspect_w = w
         self.aspect_h = h
@@ -1412,17 +1375,34 @@ class VideoFeedWidget(QLabel):
             target_h = lh
             target_w = int(lh * self.aspect_w / self.aspect_h)
 
-        pixmap = QPixmap.fromImage(img).scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pixmap = QPixmap.fromImage(img).scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation)
 
         if self.hud_visible:
-            pixmap = self._paint_hud(pixmap)
+            self._composite_hud(pixmap)
 
         self.setPixmap(pixmap)
 
-    def _paint_hud(self, pixmap):
+    def _composite_hud(self, pixmap):
+        # HUD overlay is cached and only rebuilt every _hud_interval_ms (10 Hz)
+        # so per-frame video stays smooth even though the HUD itself paints
+        # 40+ QPainter primitives.
+        now_ms = int(time.monotonic() * 1000)
+        size_now = (pixmap.width(), pixmap.height())
+        if (self._hud_overlay is None
+                or self._hud_overlay_size != size_now
+                or (now_ms - self._hud_last_paint_ms) >= self._hud_interval_ms):
+            self._hud_overlay = self._build_hud_overlay(*size_now)
+            self._hud_overlay_size = size_now
+            self._hud_last_paint_ms = now_ms
         p = QPainter(pixmap)
+        p.drawPixmap(0, 0, self._hud_overlay)
+        p.end()
+
+    def _build_hud_overlay(self, pw, ph):
+        overlay = QPixmap(pw, ph)
+        overlay.fill(Qt.transparent)
+        p = QPainter(overlay)
         p.setRenderHint(QPainter.Antialiasing)
-        pw, ph = pixmap.width(), pixmap.height()
 
         hud_bg = QColor(0, 0, 0, 150)
         hud_font = QFont("Segoe UI", 10, QFont.Bold)
@@ -1539,7 +1519,7 @@ class VideoFeedWidget(QLabel):
             p.drawText(pw - dl_w + 2, 28, depth_label)
 
         p.end()
-        return pixmap
+        return overlay
 
     def _draw_artificial_horizon(self, p, pw, ph):
         """Draw a compact artificial horizon indicator at screen center."""
@@ -2338,7 +2318,9 @@ class DetectionFeedTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.events = []
+        # Bounded ring buffer: prevents the filter/stats pass from growing O(N)
+        # unbounded over hours of operation. Older events drop off the left.
+        self.events = deque(maxlen=5000)
         self._event_by_id = {}   # track id -> its row dict (one row per object)
         self._dirty = False
         self._build_ui()
@@ -3322,13 +3304,13 @@ class SettingsTab(QWidget):
                 "lq_warn": self.lq_warn.value(),
             },
         }
-        settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "walle_settings.json")
+        settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), EDITION.settings_file)
         with open(settings_path, "w") as f:
             json.dump(settings, f, indent=2)
         QMessageBox.information(self, "Settings", "All settings saved successfully.")
 
     def load_settings(self):
-        settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "walle_settings.json")
+        settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), EDITION.settings_file)
         if not os.path.exists(settings_path):
             return
         try:
@@ -3402,12 +3384,12 @@ class SettingsTab(QWidget):
             self.lq_warn.setValue(a.get("lq_warn", 50))
 
         except Exception as e:
-            print(f"Failed to load settings: {e}")
+            log_settings.error("Failed to load settings: %s", e)
 
 
 # ─── User Credentials Store ──────────────────────────────────────────
 
-USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "walle_users.json")
+USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), EDITION.users_file)
 
 def _hash_password(password, salt=None):
     if salt is None:
@@ -3651,7 +3633,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.current_user = username
         self.current_role = role
-        self.setWindowTitle(f"Walle GCS v{APP_VERSION} - {username}")
+        self.setWindowTitle(f"Walle GCS v{APP_VERSION}{EDITION.title_tag}  - {username}")
         self.setMinimumSize(1280, 720)
         self.setStyleSheet(DARK_STYLESHEET)
 
@@ -3672,9 +3654,13 @@ class MainWindow(QMainWindow):
         self.recording = False
         self.record_start_time = None
         # Object detection engine
-        self.detect_engine = ObjectDetectionEngine(conf_thresh=0.5, depth_variant="Small")
+        self.detect_engine = ObjectDetectionEngine(conf_thresh=0.5,
+                                                   depth_variant=EDITION.depth_variant)
         self.detect_enabled = False
         self.depth_overlay_enabled = False
+        # Reused buffer for camera|depth side-by-side composite so we don't
+        # allocate a fresh ~7 MB numpy array per frame.
+        self._stacked_buffer = None
 
         self.face_rec_engine = FaceRecognitionEngine()
         self.face_rec_enabled = False
@@ -3682,7 +3668,9 @@ class MainWindow(QMainWindow):
         self.track_engine = HumanTrackerEngine()
         self.track_enabled = False
 
-        # SLAM engine + live-tap toggle (file-mode owns its own player)
+        # SLAM engine + live-tap toggle (file-mode owns its own player).
+        # Depth model variant follows the active edition (base=Small,
+        # max=Base) — see the EDITIONS table.
         self.slam_engine = SlamEngine()
         self.slam_live_enabled = False
 
@@ -3690,6 +3678,58 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._read_initial_state()
         self._start_timers()
+        # Kick off model loads in the background so toggles find engines
+        # already warm. Two important constraints:
+        #   1) Defer past the first GUI paint — heavy CUDA work during
+        #      window construction crashed the Wayland compositor on
+        #      Pop!_OS 24.04 + NVIDIA in earlier testing.
+        #   2) Chain sequentially (detect first, then face-rec). Running
+        #      both loads in parallel doubled the GPU pressure spike and
+        #      reproduced the same compositor crash.
+        # Opt out by setting WALLE_NO_PRELOAD=1.
+        if os.environ.get("WALLE_NO_PRELOAD", "0") != "1":
+            QTimer.singleShot(3000, self._preload_detect_then_facerec)
+
+        # Start the engine watchdog. Polls every 2 s and flags any engine
+        # that hasn't heartbeat for 5 s — surfaces silent worker-thread
+        # deaths the UI would otherwise miss.
+        self._watchdog = EngineWatchdog(get_health_registry(), poll_s=2.0)
+        self._watchdog.start()
+
+    def _preload_detect_then_facerec(self):
+        """Load detect engine first; chain face-rec onto its completion signal
+        so we never have two heavy model loads running at the same time."""
+        def _start_facerec(_success):
+            try:
+                self.face_rec_engine.models_loaded.disconnect(_start_facerec)
+            except TypeError:
+                pass
+            try:
+                self.detect_engine.models_loaded.disconnect(_start_facerec)
+            except TypeError:
+                pass
+            try:
+                self.face_rec_engine.load_models()
+            except Exception as e:
+                log_main.error("face-rec preload failed: %s", e)
+        try:
+            # QueuedConnection so the slot lands on the main thread regardless
+            # of which thread emits — emit fires from the load thread but we
+            # want all signal handling pinned to main.
+            self.detect_engine.models_loaded.connect(
+                _start_facerec, Qt.QueuedConnection)
+            self.detect_engine.load_models()
+            # If detect somehow already loaded (e.g. a prior toggle click),
+            # trigger the face-rec chain manually.
+            if self.detect_engine.is_ready:
+                QTimer.singleShot(0, lambda: _start_facerec(True))
+        except Exception as e:
+            log_main.error("detect preload failed: %s", e)
+            # Detect failed; still preload face-rec so at least one is warm.
+            try:
+                self.face_rec_engine.load_models()
+            except Exception as e2:
+                log_main.error("face-rec preload failed: %s", e2)
 
     def _init_pygame(self):
         pygame.init()
@@ -3962,7 +4002,7 @@ class MainWindow(QMainWindow):
         self.detection_tab = DetectionFeedTab()
         self.stack.addWidget(self.detection_tab)
 
-        self.slam_tab = SlamTab(self.slam_engine)
+        self.slam_tab = SlamTab(self.slam_engine, default_variant="base")
         self.slam_tab.live_mode_changed.connect(self._on_slam_live_changed)
         self.stack.addWidget(self.slam_tab)
 
@@ -4074,6 +4114,7 @@ class MainWindow(QMainWindow):
     def _populate_video_devices(self):
         self.video_combo.clear()
         if sys.platform == "win32":
+            # Probe MSMF first (handles HDMI capture cards), fall back to DSHOW
             for i in range(10):
                 cap = cv2.VideoCapture(i, cv2.CAP_MSMF)
                 if not cap.isOpened():
@@ -4151,11 +4192,11 @@ class MainWindow(QMainWindow):
                     self.esp32_serial = serial.Serial(port, 115200, timeout=0.1)
                     self.esp32_btn.setText("Unlink")
                     self.toast.show_message(f"ESP32 linked: {port}", "#00cc00", 2000)
-                    print(f"[ESP32] Connected to {port}")
+                    log_esp.info("Connected to %s", port)
                 except Exception as e:
                     self.esp32_btn.setChecked(False)
                     self.toast.show_message(f"ESP32 failed: {e}", "#ff3333", 3000)
-                    print(f"[ESP32] Error: {e}")
+                    log_esp.error("%s", e)
             else:
                 self.esp32_btn.setChecked(False)
         else:
@@ -4175,7 +4216,7 @@ class MainWindow(QMainWindow):
             cmd = f"{ch[0]},{ch[1]},{ch[2]},{ch[3]},{ch[4]}\n"
             self.esp32_serial.write(cmd.encode())
         except Exception as e:
-            print(f"[ESP32] Write error: {e}")
+            log_esp.error("Write error: %s", e)
             try:
                 self.esp32_serial.close()
             except Exception:
@@ -4300,8 +4341,15 @@ class MainWindow(QMainWindow):
                 cv2.putText(frame, banner, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, mc, 2, cv2.LINE_AA)
 
-                # Stack side by side: camera | depth
-                frame = np.hstack([frame, depth_color])
+                # Stack side by side: camera | depth, reusing a preallocated
+                # buffer to avoid a fresh allocation+copy every frame.
+                need_shape = (fh, fw * 2, 3)
+                if (self._stacked_buffer is None
+                        or self._stacked_buffer.shape != need_shape):
+                    self._stacked_buffer = np.empty(need_shape, dtype=np.uint8)
+                self._stacked_buffer[:, :fw] = frame
+                self._stacked_buffer[:, fw:] = depth_color
+                frame = self._stacked_buffer
 
                 self.video_widget.hud_depth_mode = mode
 
@@ -4392,7 +4440,7 @@ class MainWindow(QMainWindow):
         self.control_tab.update_telemetry(telem)
 
         # Alert checks
-        settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "walle_settings.json")
+        settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), EDITION.settings_file)
         try:
             if os.path.exists(settings_path):
                 with open(settings_path) as f:
@@ -4457,33 +4505,42 @@ class MainWindow(QMainWindow):
 
     def _toggle_detection(self, checked):
         if checked:
-            if not self.detect_engine.is_ready:
-                self.detect_btn.setText("Loading...")
-                self.detect_btn.setEnabled(False)
-                self.toast.show_message("Loading detection models...", "#00ccff", 5000)
-
-                def on_loaded(success):
-                    self.detect_btn.setEnabled(True)
-                    if success:
-                        self.detect_enabled = True
-                        self.detect_btn.setText("Detect ON")
-                        self.toast.show_message("Detection enabled - RF-DETR + Depth", "#00ccff", 3000)
-                    else:
-                        self.detect_enabled = False
-                        self.detect_btn.setChecked(False)
-                        self.detect_btn.setText("Detect")
-                        self.toast.show_message("Detection model load failed!", "#ff3333", 3000)
-
-                try:
-                    self.detect_engine.models_loaded.disconnect()
-                except TypeError:
-                    pass
-                self.detect_engine.models_loaded.connect(on_loaded)
-                self.detect_engine.load_models()
-            else:
+            if self.detect_engine.is_ready:
                 self.detect_enabled = True
                 self.detect_btn.setText("Detect ON")
                 self.toast.show_message("Detection enabled", "#00ccff", 2000)
+                return
+            self.detect_btn.setText("Loading...")
+            self.detect_btn.setEnabled(False)
+            self.toast.show_message("Loading detection models...", "#00ccff", 5000)
+
+            def on_loaded(success):
+                self.detect_btn.setEnabled(True)
+                if success:
+                    self.detect_enabled = True
+                    self.detect_btn.setText("Detect ON")
+                    self.toast.show_message("Detection enabled - RF-DETR + Depth", "#00ccff", 3000)
+                else:
+                    self.detect_enabled = False
+                    self.detect_btn.setChecked(False)
+                    self.detect_btn.setText("Detect")
+                    self.toast.show_message("Detection model load failed!", "#ff3333", 3000)
+
+            try:
+                self.detect_engine.models_loaded.disconnect()
+            except TypeError:
+                pass
+            # QueuedConnection is critical: emit fires from the load thread,
+            # but on_loaded touches QWidgets which must run on the main
+            # thread. Default AutoConnection picks DirectConnection for
+            # plain Python callables and silently drops the UI updates.
+            self.detect_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
+            self.detect_engine.load_models()
+            # Cover the race where load finished between the is_ready check
+            # and the connect — in which case the signal already fired and
+            # on_loaded would never trigger. Queue it on the main thread.
+            if self.detect_engine.is_ready:
+                QTimer.singleShot(0, lambda: on_loaded(True))
         else:
             self.detect_enabled = False
             self.detect_btn.setText("Detect")
@@ -4491,34 +4548,35 @@ class MainWindow(QMainWindow):
 
     def _toggle_depth_overlay(self, checked):
         if checked:
-            if not self.detect_engine.is_ready:
-                # Need detection engine loaded for depth maps
-                self.depth_btn.setText("Loading...")
-                self.depth_btn.setEnabled(False)
-                self.toast.show_message("Loading depth model...", "#ff8800", 5000)
-
-                def on_loaded(success):
-                    self.depth_btn.setEnabled(True)
-                    if success:
-                        self.depth_overlay_enabled = True
-                        self.depth_btn.setText("Depth ON")
-                        self.toast.show_message("Depth overlay enabled", "#ff8800", 3000)
-                    else:
-                        self.depth_overlay_enabled = False
-                        self.depth_btn.setChecked(False)
-                        self.depth_btn.setText("Depth")
-                        self.toast.show_message("Depth model load failed!", "#ff3333", 3000)
-
-                try:
-                    self.detect_engine.models_loaded.disconnect()
-                except TypeError:
-                    pass
-                self.detect_engine.models_loaded.connect(on_loaded)
-                self.detect_engine.load_models()
-            else:
+            if self.detect_engine.is_ready:
                 self.depth_overlay_enabled = True
                 self.depth_btn.setText("Depth ON")
                 self.toast.show_message("Depth overlay enabled", "#ff8800", 2000)
+                return
+            self.depth_btn.setText("Loading...")
+            self.depth_btn.setEnabled(False)
+            self.toast.show_message("Loading depth model...", "#ff8800", 5000)
+
+            def on_loaded(success):
+                self.depth_btn.setEnabled(True)
+                if success:
+                    self.depth_overlay_enabled = True
+                    self.depth_btn.setText("Depth ON")
+                    self.toast.show_message("Depth overlay enabled", "#ff8800", 3000)
+                else:
+                    self.depth_overlay_enabled = False
+                    self.depth_btn.setChecked(False)
+                    self.depth_btn.setText("Depth")
+                    self.toast.show_message("Depth model load failed!", "#ff3333", 3000)
+
+            try:
+                self.detect_engine.models_loaded.disconnect()
+            except TypeError:
+                pass
+            self.detect_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
+            self.detect_engine.load_models()
+            if self.detect_engine.is_ready:
+                QTimer.singleShot(0, lambda: on_loaded(True))
         else:
             self.depth_overlay_enabled = False
             self.depth_btn.setText("Depth")
@@ -4527,40 +4585,42 @@ class MainWindow(QMainWindow):
 
     def _toggle_face_rec(self, checked):
         if checked:
-            if not self.face_rec_engine.is_ready:
-                self.face_btn.setText("Loading...")
-                self.face_btn.setEnabled(False)
-                self.toast.show_message(
-                    "Loading face recognition models...", "#ffd000", 6000)
-
-                def on_loaded(success):
-                    self.face_btn.setEnabled(True)
-                    if success:
-                        self.face_rec_enabled = True
-                        n = self.face_rec_engine.known_count
-                        self.face_btn.setText("Face Rec ON")
-                        self.toast.show_message(
-                            f"Face recognition enabled — {n} known faces",
-                            "#ffd000", 3000)
-                    else:
-                        self.face_rec_enabled = False
-                        self.face_btn.setChecked(False)
-                        self.face_btn.setText("Face Rec")
-                        self.toast.show_message(
-                            "Face Rec load failed (see terminal)",
-                            "#ff3333", 4000)
-
-                try:
-                    self.face_rec_engine.models_loaded.disconnect()
-                except TypeError:
-                    pass
-                self.face_rec_engine.models_loaded.connect(on_loaded)
-                self.face_rec_engine.load_models()
-            else:
+            if self.face_rec_engine.is_ready:
                 self.face_rec_enabled = True
                 self.face_btn.setText("Face Rec ON")
                 self.toast.show_message("Face recognition enabled",
                                         "#ffd000", 2000)
+                return
+            self.face_btn.setText("Loading...")
+            self.face_btn.setEnabled(False)
+            self.toast.show_message(
+                "Loading face recognition models...", "#ffd000", 6000)
+
+            def on_loaded(success):
+                self.face_btn.setEnabled(True)
+                if success:
+                    self.face_rec_enabled = True
+                    n = self.face_rec_engine.known_count
+                    self.face_btn.setText("Face Rec ON")
+                    self.toast.show_message(
+                        f"Face recognition enabled — {n} known faces",
+                        "#ffd000", 3000)
+                else:
+                    self.face_rec_enabled = False
+                    self.face_btn.setChecked(False)
+                    self.face_btn.setText("Face Rec")
+                    self.toast.show_message(
+                        "Face Rec load failed (see terminal)",
+                        "#ff3333", 4000)
+
+            try:
+                self.face_rec_engine.models_loaded.disconnect()
+            except TypeError:
+                pass
+            self.face_rec_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
+            self.face_rec_engine.load_models()
+            if self.face_rec_engine.is_ready:
+                QTimer.singleShot(0, lambda: on_loaded(True))
         else:
             self.face_rec_enabled = False
             self.face_btn.setText("Face Rec")
@@ -4569,40 +4629,42 @@ class MainWindow(QMainWindow):
 
     def _toggle_track_human(self, checked):
         if checked:
-            if not self.track_engine.is_ready:
-                self.track_btn.setText("Loading...")
-                self.track_btn.setEnabled(False)
-                self.toast.show_message(
-                    "Loading human tracker (YOLOv8-pose + DeepSort)...",
-                    "#ff66cc", 6000)
-
-                def on_loaded(success):
-                    self.track_btn.setEnabled(True)
-                    if success:
-                        self.track_enabled = True
-                        self.track_btn.setText("Track ON")
-                        self.toast.show_message(
-                            "Human tracking enabled — predictive arcs live",
-                            "#ff66cc", 3000)
-                    else:
-                        self.track_enabled = False
-                        self.track_btn.setChecked(False)
-                        self.track_btn.setText("Track")
-                        self.toast.show_message(
-                            "Human tracker load failed (see terminal)",
-                            "#ff3333", 4000)
-
-                try:
-                    self.track_engine.models_loaded.disconnect()
-                except TypeError:
-                    pass
-                self.track_engine.models_loaded.connect(on_loaded)
-                self.track_engine.load_models()
-            else:
+            if self.track_engine.is_ready:
                 self.track_enabled = True
                 self.track_btn.setText("Track ON")
                 self.toast.show_message("Human tracking enabled",
                                         "#ff66cc", 2000)
+                return
+            self.track_btn.setText("Loading...")
+            self.track_btn.setEnabled(False)
+            self.toast.show_message(
+                "Loading human tracker (YOLOv8-pose + DeepSort)...",
+                "#ff66cc", 6000)
+
+            def on_loaded(success):
+                self.track_btn.setEnabled(True)
+                if success:
+                    self.track_enabled = True
+                    self.track_btn.setText("Track ON")
+                    self.toast.show_message(
+                        "Human tracking enabled — predictive arcs live",
+                        "#ff66cc", 3000)
+                else:
+                    self.track_enabled = False
+                    self.track_btn.setChecked(False)
+                    self.track_btn.setText("Track")
+                    self.toast.show_message(
+                        "Human tracker load failed (see terminal)",
+                        "#ff3333", 4000)
+
+            try:
+                self.track_engine.models_loaded.disconnect()
+            except TypeError:
+                pass
+            self.track_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
+            self.track_engine.load_models()
+            if self.track_engine.is_ready:
+                QTimer.singleShot(0, lambda: on_loaded(True))
         else:
             self.track_enabled = False
             self.track_btn.setText("Track")
@@ -4620,10 +4682,10 @@ class MainWindow(QMainWindow):
         pygame.event.pump()
         num_axes = self.joystick.get_numaxes()
         num_buttons = self.joystick.get_numbuttons()
-        print(f"[Joystick] {self.joystick.get_name()}: {num_axes} axes, {num_buttons} buttons")
+        log_joy.info("%s: %d axes, %d buttons", self.joystick.get_name(), num_axes, num_buttons)
         for i in range(num_axes):
             val = self.joystick.get_axis(i)
-            print(f"  Axis {i}: {val:+.3f}")
+            log_joy.debug("  Axis %d: %+.3f", i, val)
 
         # Arm state now derived from CRSF flight mode telemetry (VCP), not joystick
         self.control_tab.set_armed(self.armed)
@@ -4735,6 +4797,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    log_path = configure_logging()
+    cfg = get_config()
+    log_main.info("walle_gcs (%s edition) starting (log: %s)", EDITION.name, log_path)
+    log_main.info("config: depth_zone=%s detection=%s",
+                  cfg.depth_zone, cfg.detection)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 

@@ -1,13 +1,23 @@
-# Walle GCS — MAX edition (`walle_gcs_max.py`)
+# Walle GCS (`walle_gcs.py`)
 
 Ground Control Station for a Betaflight + ELRS FPV drone. Talks to a RadioMaster
 TX over USB (CRSF telemetry), shows the DJI O4 video feed from an HDMI capture
 card, and runs a stack of AI engines (object detection + depth, face
 recognition, human tracking, 2D SLAM, 3D reconstruction) on the live feed.
 
-The **MAX edition** is the same GCS as `walle_gcs.py` but wired to the bigger,
-more accurate AI models. It keeps its own config files so the two builds don't
-overwrite each other's settings.
+**One application, two editions**, selected at launch with `--edition base|max`
+(default `base`). The edition picks the AI model sizes and the config/credential
+files; all other code is shared:
+
+| | detection | depth | settings / users |
+|---|---|---|---|
+| `base` | RF-DETR Base | Depth-Anything-V2 Small | `walle_settings.json` / `walle_users.json` |
+| `max` | RF-DETR Medium | Depth-Anything-V2 Base | `walle_settings_max.json` / `walle_users_max.json` |
+
+Launch via the wrapper scripts — `./walle-gcs` (base) or `./walle-gcs-max`
+(max) — which pass the right `--edition` flag. The two editions use separate
+config files so MAX settings never overwrite the regular build's. See the
+`EDITIONS` table near the top of `walle_gcs.py`.
 
 > ⚠️ This repo is mid-reorganization. `walle_gcs_max.py` was recently moved into
 > this `walle_gcs/` folder; `slam_engine.py` and the model/data files still live
@@ -137,11 +147,11 @@ repo root:
 Things in this file (and around it) that look like duplication, dead code, or
 stale references — worth a cleanup pass:
 
-1. **`walle_gcs.py` vs `walle_gcs_max.py` are ~99% identical.** Only ~40 lines
-   differ: the model classes (`RFDETRMedium` vs `RFDETRBase`), the depth variant
-   (`"Base"` vs `"Small"`), the version string, and the four engine imports.
-   Every bug fix currently has to be made twice. This could collapse into one
-   file with a `--max` flag or a config key.
+1. ~~**`walle_gcs.py` vs `walle_gcs_max.py` are ~99% identical.**~~ **DONE.**
+   The twin files were merged into a single `walle_gcs.py` with an `EDITIONS`
+   table and a `--edition base|max` flag; `walle_gcs_max.py` was deleted. The
+   only edition-specific values (model classes, depth variant, version string,
+   config/credential filenames, title tag) now live in one place.
 
 2. **`DEPTH_MODELS` still defines a `"Small"` entry** even though the MAX edition
    is hard-wired to `depth_variant="Base"`. The `"Small"` line is dead in this
