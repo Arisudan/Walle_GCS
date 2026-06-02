@@ -30,7 +30,8 @@ import hashlib
 # Wayland compositor crashes on Pop!_OS 24.04 under sustained NVIDIA driver
 # load (heavy ONNX/CUDA inference). XCB is the rock-solid X11 path.
 # Set BEFORE any PyQt5 import. ``setdefault`` so an explicit env var still wins.
-if sys.platform != "win32":
+# Linux only — macOS has no XCB plugin and Windows uses its own ``windows`` QPA.
+if sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 from datetime import datetime, timedelta
 from collections import deque
@@ -45,6 +46,49 @@ import torch
 from PIL import Image as PILImage
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 from rfdetr import RFDETRBase, RFDETRMedium
+
+
+# ─── PyTorch CPU/GPU configuration ──────────────────────────────────
+# By default PyTorch grabs one intra-op worker per physical core and
+# pegs them all even when the heavy work is queued on the GPU — that
+# alone pushed walle_gcs to ~99% CPU on multi-core hosts. Two threads
+# are enough to stage frames into the GPU and run the cv2 preproc;
+# anything more just oversubscribes. `WALLE_TORCH_THREADS` overrides.
+try:
+    _n_threads = int(os.environ.get("WALLE_TORCH_THREADS", "0")) or 2
+    torch.set_num_threads(max(1, _n_threads))
+except (RuntimeError, ValueError):
+    pass
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    # set_num_interop_threads must run before any parallel work; calling
+    # it after the pool has spun up raises. Safe to ignore — the cap is
+    # a one-time tuning knob, not a correctness requirement.
+    pass
+
+
+def _select_device():
+    """Pick the best inference device available on this host.
+
+    Order: CUDA (NVIDIA, Windows + Linux) → MPS (Apple Silicon) → CPU.
+    Returns (torch.device, model_dtype). fp16 is only safe on CUDA/MPS;
+    on CPU we stay in fp32 (the HF DPT head misbehaves in fp16 on CPU).
+    """
+    if torch.cuda.is_available():
+        # cuDNN benchmark + TF32 are the two biggest single-line wins
+        # for a CNN/ViT inference workload with mostly-static shapes.
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except AttributeError:
+            pass
+        return torch.device("cuda"), torch.float16
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return torch.device("mps"), torch.float16
+    return torch.device("cpu"), torch.float32
 
 # This script lives in walle_gcs/. Its shared sibling module ``slam_engine``
 # (and the model/data files it expects) stay in the rosetta project root, so
@@ -552,8 +596,9 @@ class ObjectDetectionEngine(QObject):
 
         def _load():
             try:
-                self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                log_det.info("Device: %s", self._device)
+                self._device, self._model_dtype = _select_device()
+                log_det.info("Device: %s (dtype: %s)",
+                             self._device, self._model_dtype)
 
                 log_det.info("Loading %s (%s edition) ...",
                              EDITION.detect_model.__name__, EDITION.name)
@@ -563,21 +608,28 @@ class ObjectDetectionEngine(QObject):
                 # stress the NVIDIA + Wayland compositor combo on Pop!_OS
                 # (we've seen it crash the Wayland connection on first run).
                 # Off by default; flip on via RFDETR_COMPILE=1 once verified.
+                # optimize_for_inference assumes an accelerator (fp16 + GPU
+                # kernels); on CPU it just errors, so we only call it when
+                # CUDA/MPS is in play.
                 _use_compile = os.environ.get("RFDETR_COMPILE", "0") == "1"
-                try:
-                    self._det_model.optimize_for_inference(
-                        compile=_use_compile, dtype=torch.float16
-                    )
-                    tag = "fp16, compiled" if _use_compile else "fp16"
-                    log_det.info("RF-DETR optimized for inference (%s)", tag)
-                except Exception as e:
-                    log_det.warning("optimize_for_inference skipped: %s", e)
+                if self._device.type in ("cuda", "mps"):
+                    try:
+                        self._det_model.optimize_for_inference(
+                            compile=_use_compile, dtype=self._model_dtype
+                        )
+                        tag = "fp16, compiled" if _use_compile else "fp16"
+                        log_det.info("RF-DETR optimized for inference (%s)", tag)
+                    except Exception as e:
+                        log_det.warning("optimize_for_inference skipped: %s", e)
+                else:
+                    log_det.info("RF-DETR running on CPU (fp32) — install "
+                                 "CUDA/MPS PyTorch for GPU acceleration")
 
                 model_id = DEPTH_MODELS[self.depth_variant]
                 log_det.info("Loading depth model: %s", model_id)
                 self._depth_processor = AutoImageProcessor.from_pretrained(model_id)
                 self._depth_model = AutoModelForDepthEstimation.from_pretrained(
-                    model_id, torch_dtype=torch.float16
+                    model_id, torch_dtype=self._model_dtype
                 ).to(self._device)
                 self._depth_model.eval()
                 self._cache_depth_preproc()
@@ -688,12 +740,13 @@ class ObjectDetectionEngine(QObject):
         std = np.asarray(getattr(proc, "image_std", [0.5, 0.5, 0.5]),
                          dtype=np.float32)
         rescale = float(getattr(proc, "rescale_factor", 1.0 / 255.0))
-        # Preconvert to (1, 3, 1, 1) tensors on the model device in fp16 so
-        # broadcast-normalize is a fused GPU op.
+        # Preconvert to (1, 3, 1, 1) tensors on the model device using the
+        # same dtype as the model so broadcast-normalize stays a single
+        # fused op (no implicit cast). On CPU this is fp32, on CUDA/MPS fp16.
         self._depth_mean_t = torch.from_numpy(mean).to(
-            self._device, dtype=torch.float16).view(1, 3, 1, 1)
+            self._device, dtype=self._model_dtype).view(1, 3, 1, 1)
         self._depth_std_t = torch.from_numpy(std).to(
-            self._device, dtype=torch.float16).view(1, 3, 1, 1)
+            self._device, dtype=self._model_dtype).view(1, 3, 1, 1)
         self._depth_rescale = rescale
 
     @torch.inference_mode()
@@ -703,10 +756,11 @@ class ObjectDetectionEngine(QObject):
         # bilinear default closely enough for monocular depth.
         resized = cv2.resize(bgr_frame, (tw, th), interpolation=cv2.INTER_LINEAR)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        # HWC uint8 -> 1xCxHxW fp16 on device, normalize on GPU.
+        # HWC uint8 -> 1xCxHxW on device in the model dtype, normalize on GPU.
+        # non_blocking is a CUDA pinned-memory optimization; harmless elsewhere.
         t = torch.from_numpy(rgb).to(self._device, non_blocking=True)
-        t = t.permute(2, 0, 1).unsqueeze(0).to(torch.float16)
-        t = t * (self._depth_rescale)  # implicit fp16 mult
+        t = t.permute(2, 0, 1).unsqueeze(0).to(self._model_dtype)
+        t = t * self._depth_rescale
         t = (t - self._depth_mean_t) / self._depth_std_t
         out = self._depth_model(pixel_values=t)
         depth = out.predicted_depth.squeeze().float().cpu().numpy()
@@ -1153,6 +1207,10 @@ class VideoCapture(QThread):
             cap = cv2.VideoCapture(self.device_index, cv2.CAP_MSMF)
             if not cap.isOpened():
                 cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
+        elif sys.platform == "darwin":
+            # macOS: AVFoundation is the only working OpenCV backend; CAP_ANY
+            # sometimes picks a deprecated QTKit path that fails to open.
+            cap = cv2.VideoCapture(self.device_index, cv2.CAP_AVFOUNDATION)
         else:
             cap = cv2.VideoCapture(self.device_index, cv2.CAP_ANY)
         if not cap.isOpened():
@@ -4168,6 +4226,13 @@ class MainWindow(QMainWindow):
                 if cap.isOpened():
                     self.video_combo.addItem(f"Camera {i}", i)
                     cap.release()
+        elif sys.platform == "darwin":
+            # macOS has no /dev/video* nodes — probe AVFoundation directly.
+            for i in range(10):
+                cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
+                if cap.isOpened():
+                    self.video_combo.addItem(f"Camera {i}", i)
+                    cap.release()
         else:
             for i in range(10):
                 if os.path.exists(f"/dev/video{i}"):
@@ -4549,6 +4614,26 @@ class MainWindow(QMainWindow):
             self.status_recording.setText("")
             self.toast.show_message("Recording stopped", "#00cc00", 2000)
 
+    def _await_engine(self, engine, on_done, interval_ms=250):
+        """Poll ``engine`` until it reaches a terminal state, then fire on_done.
+
+        Replaces the old ``models_loaded`` signal+disconnect dance, which had
+        two failure modes: (1) the emit could race against connect/disconnect
+        and silently drop the slot, and (2) ``disconnect()`` on the engine
+        nuked the preload chain that wires face-rec onto detect's completion.
+        Polling on the GUI thread is racefree and stays main-thread by
+        construction, so the callback can touch widgets safely.
+        """
+        if engine.is_ready:
+            on_done(True)
+            return
+        if not getattr(engine, "_loading", False):
+            # Not ready and not loading anymore → load failed (or never started).
+            on_done(False)
+            return
+        QTimer.singleShot(interval_ms,
+                          lambda: self._await_engine(engine, on_done, interval_ms))
+
     def _toggle_detection(self, checked):
         if checked:
             if self.detect_engine.is_ready:
@@ -4572,21 +4657,8 @@ class MainWindow(QMainWindow):
                     self.detect_btn.setText("Detect")
                     self.toast.show_message("Detection model load failed!", "#ff3333", 3000)
 
-            try:
-                self.detect_engine.models_loaded.disconnect()
-            except TypeError:
-                pass
-            # QueuedConnection is critical: emit fires from the load thread,
-            # but on_loaded touches QWidgets which must run on the main
-            # thread. Default AutoConnection picks DirectConnection for
-            # plain Python callables and silently drops the UI updates.
-            self.detect_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
-            self.detect_engine.load_models()
-            # Cover the race where load finished between the is_ready check
-            # and the connect — in which case the signal already fired and
-            # on_loaded would never trigger. Queue it on the main thread.
-            if self.detect_engine.is_ready:
-                QTimer.singleShot(0, lambda: on_loaded(True))
+            self.detect_engine.load_models()  # no-op if already loading/loaded
+            self._await_engine(self.detect_engine, on_loaded)
         else:
             self.detect_enabled = False
             self.detect_btn.setText("Detect")
@@ -4615,14 +4687,8 @@ class MainWindow(QMainWindow):
                     self.depth_btn.setText("Depth")
                     self.toast.show_message("Depth model load failed!", "#ff3333", 3000)
 
-            try:
-                self.detect_engine.models_loaded.disconnect()
-            except TypeError:
-                pass
-            self.detect_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
             self.detect_engine.load_models()
-            if self.detect_engine.is_ready:
-                QTimer.singleShot(0, lambda: on_loaded(True))
+            self._await_engine(self.detect_engine, on_loaded)
         else:
             self.depth_overlay_enabled = False
             self.depth_btn.setText("Depth")
@@ -4656,17 +4722,11 @@ class MainWindow(QMainWindow):
                     self.face_btn.setChecked(False)
                     self.face_btn.setText("Face Rec")
                     self.toast.show_message(
-                        "Face Rec load failed (see terminal)",
+                        "Face Rec load failed — is onnxruntime installed?",
                         "#ff3333", 4000)
 
-            try:
-                self.face_rec_engine.models_loaded.disconnect()
-            except TypeError:
-                pass
-            self.face_rec_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
             self.face_rec_engine.load_models()
-            if self.face_rec_engine.is_ready:
-                QTimer.singleShot(0, lambda: on_loaded(True))
+            self._await_engine(self.face_rec_engine, on_loaded)
         else:
             self.face_rec_enabled = False
             self.face_btn.setText("Face Rec")
@@ -4703,14 +4763,8 @@ class MainWindow(QMainWindow):
                         "Human tracker load failed (see terminal)",
                         "#ff3333", 4000)
 
-            try:
-                self.track_engine.models_loaded.disconnect()
-            except TypeError:
-                pass
-            self.track_engine.models_loaded.connect(on_loaded, Qt.QueuedConnection)
             self.track_engine.load_models()
-            if self.track_engine.is_ready:
-                QTimer.singleShot(0, lambda: on_loaded(True))
+            self._await_engine(self.track_engine, on_loaded)
         else:
             self.track_enabled = False
             self.track_btn.setText("Track")
