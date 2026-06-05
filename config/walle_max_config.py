@@ -148,12 +148,22 @@ class VideoConfig:
     port: int = 5600
     aspect_w: int = 16
     aspect_h: int = 9
+    # Cap the resolution that flows through the per-frame GUI pipeline
+    # (overlay drawing, depth colorize/stack, QPixmap scale). HDMI capture
+    # cards often only deliver native (e.g. 1080p) frames; we request this
+    # size and, if the card ignores it, downscale on the capture thread so
+    # the GUI thread never composites more pixels than it needs to.
+    # 0 on either axis disables the cap.
+    capture_max_width: int = 1280
+    capture_max_height: int = 720
 
     def validate(self) -> None:
         if not (1 <= self.port <= 65535):
             raise ValueError(f"video.port={self.port} not a valid TCP port")
         if self.aspect_w <= 0 or self.aspect_h <= 0:
             raise ValueError("video.aspect_w / aspect_h must be positive")
+        if self.capture_max_width < 0 or self.capture_max_height < 0:
+            raise ValueError("video.capture_max_width / height must be >= 0")
 
 
 @dataclass

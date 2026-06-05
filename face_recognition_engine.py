@@ -390,8 +390,10 @@ class FaceRecognitionEngine(QObject):
         # Submit the latest frame to the inference worker. If the worker is
         # still busy on a previous frame, we just overwrite — that's the
         # "latest frame wins" semantics that keeps display FPS at camera FPS.
+        # Copy so the worker runs SCRFD on the un-annotated pixels without
+        # racing the in-place _draw() below.
         with self._lock:
-            self._infer_input_frame = frame
+            self._infer_input_frame = frame.copy()
         self._infer_pending.set()
 
         return self._draw(frame)

@@ -8,7 +8,6 @@ Tested against walle_gcs; the logic is identical in walle_gcs_max (the builds
 differ only in model selection / config paths).
 """
 import math
-import struct
 import unittest
 
 import numpy as np
@@ -35,35 +34,25 @@ class AuthTest(unittest.TestCase):
         self.assertNotEqual(s1, s2)
 
 
-class CRSFTelemetryTest(unittest.TestCase):
-    def test_battery_frame(self):
-        tel = g.CRSFTelemetry()
-        # voltage(2) current(2) capacity(3) remaining(1), big-endian, deci-units
-        payload = struct.pack(">H", 168) + struct.pack(">H", 50) + b"\x00\x00\x00" + bytes([75])
-        tel.parse_frame(g.CRSF_FRAMETYPE_BATTERY, payload)
-        self.assertAlmostEqual(tel.battery_voltage, 16.8, places=3)
-        self.assertAlmostEqual(tel.battery_current, 5.0, places=3)
+class TelemetryTest(unittest.TestCase):
+    """The MAVLink telemetry holder starts in a safe, zeroed state and
+    exposes the field names the GUI renders."""
 
-    def test_gps_frame(self):
-        tel = g.CRSFTelemetry()
-        payload = (struct.pack(">i", 377749000)    # lat * 1e7
-                   + struct.pack(">i", -1224194000)  # lon * 1e7
-                   + struct.pack(">H", 360)          # ground speed dm/s -> 10 m/s
-                   + struct.pack(">H", 18000)        # heading cdeg -> 180.0
-                   + struct.pack(">H", 1100)         # altitude, offset +1000 -> 100 m
-                   + bytes([9]))                     # satellites
-        tel.parse_frame(g.CRSF_FRAMETYPE_GPS, payload)
-        self.assertAlmostEqual(tel.latitude, 37.7749, places=4)
-        self.assertAlmostEqual(tel.longitude, -122.4194, places=4)
-        self.assertAlmostEqual(tel.ground_speed, 10.0, places=3)
-        self.assertAlmostEqual(tel.heading, 180.0, places=3)
-        self.assertEqual(tel.altitude, 100)
-        self.assertEqual(tel.satellites, 9)
+    def test_defaults_are_safe(self):
+        tel = g.Telemetry()
+        self.assertFalse(tel.armed)
+        self.assertEqual(tel.link_quality, 0)
+        self.assertEqual(tel.battery_voltage, 0.0)
+        self.assertEqual(tel.flight_mode, "")
 
-    def test_short_payload_is_ignored(self):
-        tel = g.CRSFTelemetry()
-        tel.parse_frame(g.CRSF_FRAMETYPE_BATTERY, b"\x01\x02")  # too short
-        self.assertEqual(tel.battery_voltage, 0.0)  # untouched default
+    def test_has_gui_consumed_fields(self):
+        tel = g.Telemetry()
+        for field in ("battery_voltage", "battery_current", "battery_percent",
+                      "link_quality", "rssi_1", "snr", "pitch", "roll", "yaw",
+                      "heading", "altitude", "ground_speed", "satellites",
+                      "latitude", "longitude", "vertical_speed", "flight_mode",
+                      "armed"):
+            self.assertTrue(hasattr(tel, field), f"missing field {field!r}")
 
 
 class DepthTest(unittest.TestCase):
@@ -100,22 +89,6 @@ class DistanceGeometryTest(unittest.TestCase):
         self.assertAlmostEqual(out["scaled_los_m"], 4.0, places=3)
         self.assertAlmostEqual(out["ground_m"], 4.0 * math.cos(math.radians(-30)), places=3)
         self.assertAlmostEqual(out["vert_m"], 4.0 * abs(math.sin(math.radians(-30))), places=3)
-
-
-class JoystickCalibrationTest(unittest.TestCase):
-    def test_passthrough_when_uncalibrated(self):
-        cal = g.JoystickCalibration()
-        self.assertEqual(cal.apply(0, 0.42), 0.42)
-
-    def test_symmetric_mapping_when_calibrated(self):
-        cal = g.JoystickCalibration(num_axes=4)
-        cal.mins = [-1.0] * 4
-        cal.centers = [0.0] * 4
-        cal.maxs = [1.0] * 4
-        cal.calibrated = True
-        self.assertAlmostEqual(cal.apply(0, 0.5), 0.5, places=6)
-        self.assertAlmostEqual(cal.apply(0, -0.5), -0.5, places=6)
-        self.assertAlmostEqual(cal.apply(0, 0.0), 0.0, places=6)
 
 
 if __name__ == "__main__":

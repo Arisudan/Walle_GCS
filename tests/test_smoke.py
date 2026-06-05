@@ -23,7 +23,7 @@ BUILDS = [
 EXPECTED_TABS = ["control_tab", "detection_tab", "logs_tab",
                  "settings_tab", "slam_tab", "recon_tab"]
 
-EXPECTED_TOGGLES = ["_toggle_video", "_toggle_serial", "_toggle_esp32",
+EXPECTED_TOGGLES = ["_toggle_video", "_toggle_mav",
                     "_toggle_detection", "_toggle_depth_overlay",
                     "_toggle_face_rec", "_toggle_track_human"]
 

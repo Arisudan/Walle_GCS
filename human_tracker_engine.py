@@ -178,8 +178,11 @@ class HumanTrackerEngine(QObject):
         if not self._loaded or frame is None:
             return frame
 
+        # Hand the worker a clean snapshot: _draw() below mutates `frame`
+        # in place (boxes, skeletons, trajectories), and the inference worker
+        # must see the un-annotated pixels without racing that drawing.
         with self._lock:
-            self._infer_input_frame = frame
+            self._infer_input_frame = frame.copy()
         self._infer_pending.set()
 
         return self._draw(frame)

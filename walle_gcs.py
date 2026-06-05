@@ -39,9 +39,6 @@ from collections import deque
 import cv2
 import matplotlib
 import numpy as np
-import pygame
-import serial
-import serial.tools.list_ports
 import torch
 from PIL import Image as PILImage
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
@@ -157,12 +154,9 @@ from human_tracker_engine import HumanTrackerEngine
 from slam_engine import SlamEngine, SlamTab
 from reconstruction_engine import ReconstructionTab
 
-log_crsf = get_logger("CRSF")
-log_serial = get_logger("Serial")
 log_det = get_logger("Detection")
 log_cam = get_logger("CameraThread")
-log_esp = get_logger("ESP32")
-log_joy = get_logger("Joystick")
+log_mav = get_logger("MAVLink")
 log_main = get_logger("MainWindow")
 log_settings = get_logger("Settings")
 from PyQt5.QtWidgets import (
@@ -187,19 +181,11 @@ from PyQt5.QtGui import (
 from PyQt5.QtCore import QPointF
 
 
-# ─── CRSF Protocol — moved to protocol/crsf.py ──────────────────────
-# CRSFTelemetry, SerialReader, and the CRSF_FRAMETYPE_* constants now
-# live in protocol/crsf.py so this file isn't responsible for radio-
-# link parsing. Re-exported here under the historical names so other
-# code in this file (e.g. parse_frame() calls from tests) keeps
-# working without a churning rename.
-from protocol.crsf import (
-    CRSF_SYNC_BYTE, CRSF_SYNC_BYTE_TX,
-    CRSF_FRAMETYPE_GPS, CRSF_FRAMETYPE_VARIO, CRSF_FRAMETYPE_BATTERY,
-    CRSF_FRAMETYPE_LINK_STATS, CRSF_FRAMETYPE_RC_CHANNELS,
-    CRSF_FRAMETYPE_ATTITUDE, CRSF_FRAMETYPE_FLIGHT_MODE,
-    CRSFTelemetry, SerialReader,
-)
+# ─── MAVLink link — see protocol/mavlink.py ─────────────────────────
+# The vehicle link is plain MAVLink over UDP (QGroundControl-style).
+# Telemetry parsing and command sending live in protocol/mavlink.py so
+# this file isn't responsible for the wire protocol.
+from protocol.mavlink import MAVLinkConnection, Telemetry
 
 # ─── Application Version ────────────────────────────────────────────
 APP_VERSION = EDITION.version
@@ -511,6 +497,10 @@ class ObjectDetectionEngine(QObject):
         self._depth_model = None
         self._device = None
         self._depth_map = None
+        # Bumped each time the depth worker stores a new map, so the display
+        # can colorize/stack the depth panel only when it actually changes
+        # (the map updates at depth_target_fps, far below display FPS).
+        self._depth_version = 0
         self._depth_ms = 0.0
         self._det_ms = 0.0
         self._dist_history = {}
@@ -717,6 +707,7 @@ class ObjectDetectionEngine(QObject):
             self._depth_health.record_inference(ms)
             with self._lock:
                 self._depth_map = depth
+                self._depth_version += 1
                 self._depth_ms = ms
 
     def _cache_depth_preproc(self):
@@ -823,9 +814,14 @@ class ObjectDetectionEngine(QObject):
         pitch = pitch_deg if pitch_deg is not None else self.camera_pitch
 
         # Submit current frame to BOTH async workers. Latest-frame-wins.
+        # Hand the workers their own clean snapshot: the GUI thread is about
+        # to draw detection boxes / depth zones onto `frame` below, and the
+        # workers must run inference on the un-annotated pixels (and not race
+        # the in-place drawing). One copy is shared by both read-only workers.
+        clean = frame.copy()
         with self._lock:
-            self._depth_frame = frame
-            self._det_input_frame = frame
+            self._depth_frame = clean
+            self._det_input_frame = clean
             self._det_altitude = altitude
             self._det_pitch = pitch
         self._depth_pending.set()
@@ -1185,6 +1181,15 @@ class ObjectDetectionEngine(QObject):
         with self._lock:
             return self._depth_map.copy() if self._depth_map is not None else None
 
+    def get_depth_version(self):
+        """Monotonic counter of how many depth maps have been produced.
+
+        Cheap (no copy) — lets the display skip recolorizing identical depth
+        data, which only changes at depth_target_fps.
+        """
+        with self._lock:
+            return self._depth_version
+
     def stop(self):
         self._depth_stop.set()
         if self._depth_thread:
@@ -1192,13 +1197,37 @@ class ObjectDetectionEngine(QObject):
 
 
 class VideoCapture(QThread):
-    """Captures video from HDMI capture card (DJI O4 via /dev/video*)."""
+    """Captures video from HDMI capture card (DJI O4 via /dev/video*).
+
+    Frames are delivered with **drop-to-latest backpressure**: the capture
+    loop always drains the camera (so the displayed frame is never stale),
+    but only emits ``frame_ready`` when the GUI thread has finished the
+    previous frame. Without this, ``frame_ready`` is a queued cross-thread
+    signal that piles up unbounded the moment per-frame GUI work exceeds the
+    camera interval — growing latency + memory and tanking perceived FPS.
+    The consumer calls :meth:`frame_consumed` when it is ready for the next
+    frame.
+    """
     frame_ready = pyqtSignal(np.ndarray)
 
-    def __init__(self, device_index=0):
+    def __init__(self, device_index=0, max_width=0, max_height=0):
         super().__init__()
         self.device_index = device_index
         self.running = False
+        # Resolution cap for the per-frame GUI pipeline (0 = no cap).
+        self.max_width = int(max_width)
+        self.max_height = int(max_height)
+        # Starts set so the very first captured frame is emitted.
+        self._consumer_ready = threading.Event()
+        self._consumer_ready.set()
+
+    def frame_consumed(self):
+        """Signal that the GUI thread is ready for the next frame.
+
+        Called from the consumer slot once it has finished compositing the
+        previous frame. Safe to call from any thread.
+        """
+        self._consumer_ready.set()
 
     def run(self):
         self.running = True
@@ -1217,143 +1246,47 @@ class VideoCapture(QThread):
             log_cam.error("Cannot open camera %s.", self.device_index)
             return
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Ask the card for the capped resolution. Many HDMI grabbers ignore
+        # this and keep delivering native frames, so we also downscale below
+        # as a guaranteed software fallback.
+        if self.max_width > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.max_width)
+        if self.max_height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.max_height)
         while self.running:
             ret, frame = cap.read()
-            if ret:
-                self.frame_ready.emit(frame)
-            else:
+            if not ret:
                 time.sleep(0.01)
+                continue
+
+            # Software resolution cap (off the GUI thread). Preserve aspect
+            # ratio; only ever shrink, never upscale.
+            if self.max_width > 0 and self.max_height > 0:
+                fh, fw = frame.shape[:2]
+                if fw > self.max_width or fh > self.max_height:
+                    scale = min(self.max_width / fw, self.max_height / fh)
+                    frame = cv2.resize(
+                        frame, (int(fw * scale), int(fh * scale)),
+                        interpolation=cv2.INTER_AREA)
+
+            # Drop-to-latest: only hand a frame to the GUI thread when it has
+            # signalled it is ready for the next one. Frames captured while
+            # the GUI is busy are simply dropped (we keep draining the camera
+            # buffer above), so the consumer always gets the freshest frame
+            # and the event queue never backs up.
+            if self._consumer_ready.is_set():
+                self._consumer_ready.clear()
+                # Emit a private copy: cap.read() reuses its internal buffer
+                # (BUFFERSIZE=1), so without this the consumer + inference
+                # workers would read pixels being overwritten by the next read.
+                self.frame_ready.emit(frame.copy())
         cap.release()
 
     def stop(self):
         self.running = False
+        # Unblock any consumer-ready wait and let run() observe running=False.
+        self._consumer_ready.set()
         self.wait(2000)
-
-
-class JoystickCalibration:
-    """Stores per-axis min/center/max calibration data."""
-
-    def __init__(self, num_axes=8):
-        self.num_axes = num_axes
-        self.reset(num_axes)
-
-    def reset(self, num_axes=None):
-        if num_axes is not None:
-            self.num_axes = num_axes
-        self.mins = [0.0] * self.num_axes
-        self.centers = [0.0] * self.num_axes
-        self.maxs = [0.0] * self.num_axes
-        self.calibrated = False
-
-    def apply(self, axis_index, raw_value):
-        if not self.calibrated or axis_index >= self.num_axes:
-            return raw_value
-        center = self.centers[axis_index]
-        if raw_value < center:
-            rng = center - self.mins[axis_index]
-            return (raw_value - center) / rng if rng > 0.01 else 0.0
-        else:
-            rng = self.maxs[axis_index] - center
-            return (raw_value - center) / rng if rng > 0.01 else 0.0
-
-
-# ─── Custom Widgets ──────────────────────────────────────────────────
-
-class StickWidget(QWidget):
-    """Displays a single joystick position as a crosshair in a box."""
-
-    def __init__(self, label="Stick", parent=None):
-        super().__init__(parent)
-        self.label = label
-        self.x = 0.0
-        self.y = 0.0
-        self.setMinimumSize(130, 130)
-
-    def set_position(self, x, y):
-        self.x = max(-1.0, min(1.0, x))
-        self.y = max(-1.0, min(1.0, -y))
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        margin = 10
-
-        # Background
-        p.fillRect(0, 0, w, h, QColor(14, 14, 14))
-        p.setPen(QPen(QColor(40, 40, 40), 1))
-        p.drawRoundedRect(margin, margin, w - 2 * margin, h - 2 * margin, 6, 6)
-
-        # Crosshairs
-        p.setPen(QPen(QColor(30, 30, 30), 1, Qt.DashLine))
-        cx, cy = w // 2, h // 2
-        p.drawLine(margin, cy, w - margin, cy)
-        p.drawLine(cx, margin, cx, h - margin)
-
-        # Grid circles
-        p.setPen(QPen(QColor(25, 25, 25), 1))
-        radius = min(w, h) // 2 - margin
-        p.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
-        p.drawEllipse(cx - radius // 2, cy - radius // 2, radius, radius)
-
-        area_w = w - 2 * margin
-        area_h = h - 2 * margin
-        px = margin + (self.x + 1) / 2 * area_w
-        py = margin + (1 - (self.y + 1) / 2) * area_h
-
-        # Dot glow effect
-        glow = QColor(0, 200, 0, 40)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(glow))
-        p.drawEllipse(int(px) - 14, int(py) - 14, 28, 28)
-
-        p.setPen(QPen(QColor(0, 200, 0), 2))
-        p.setBrush(QBrush(QColor(0, 255, 0, 200)))
-        p.drawEllipse(int(px) - 6, int(py) - 6, 12, 12)
-
-        p.setPen(QColor(100, 100, 100))
-        p.setFont(QFont("Segoe UI", 8))
-        p.drawText(margin + 4, h - margin - 4, self.label)
-        p.end()
-
-
-class ChannelBar(QWidget):
-    """Horizontal bar showing a single RC channel value."""
-
-    def __init__(self, channel_name="CH", parent=None):
-        super().__init__(parent)
-        self.channel_name = channel_name
-        self.value = 1500
-        self.setMinimumHeight(20)
-        self.setMaximumHeight(20)
-
-    def set_value(self, val):
-        self.value = val
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, QColor(14, 14, 14))
-
-        fraction = max(0, min(1, (self.value - 1000) / 1000))
-        bar_w = int(fraction * (w - 60))
-        color = QColor(0, 180, 0) if 1450 < self.value < 1550 else QColor(0, 140, 255)
-        if self.value > 1800 or self.value < 1200:
-            color = QColor(255, 140, 0)
-
-        # Rounded bar
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(color))
-        p.drawRoundedRect(50, 3, bar_w, h - 6, 3, 3)
-
-        p.setPen(QColor(150, 150, 150))
-        p.setFont(QFont("Segoe UI", 8))
-        p.drawText(2, 14, f"{self.channel_name}")
-        p.drawText(w - 38, 14, f"{self.value}")
-        p.end()
 
 
 class NotificationToast(QWidget):
@@ -1729,312 +1662,6 @@ class VideoFeedWidget(QLabel):
         p.setFont(QFont("Segoe UI", 7))
         p.setPen(QColor(100, 100, 100))
         p.drawText(tape_x + 6, tape_y + 12, "SPD m/s")
-
-
-# ─── Calibration Dialog ─────────────────────────────────────────────
-
-class CalibrationDialog(QWidget):
-    """Pop-up window for joystick calibration with stick visualization."""
-    calibration_done = pyqtSignal(object)
-
-    def __init__(self, joystick, parent=None):
-        super().__init__(parent)
-        self.joystick = joystick
-        self.setWindowTitle("Joystick Calibration")
-        self.setMinimumSize(600, 600)
-        self.setStyleSheet(DARK_STYLESHEET)
-
-        self.num_axes = joystick.get_numaxes() if joystick else 0
-        self.cal = JoystickCalibration(max(self.num_axes, 8))
-        self.phase = "idle"
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
-
-        self.instruction = QLabel("Press 'Start' to begin calibration.")
-        self.instruction.setAlignment(Qt.AlignCenter)
-        self.instruction.setStyleSheet("color: #00cc00; font-size: 14px; padding: 10px;")
-        layout.addWidget(self.instruction)
-
-        sticks_layout = QHBoxLayout()
-        self.left_stick = StickWidget("Left (Thr/Yaw)")
-        self.right_stick = StickWidget("Right (Pitch/Roll)")
-        sticks_layout.addWidget(self.left_stick)
-        sticks_layout.addWidget(self.right_stick)
-        layout.addLayout(sticks_layout)
-
-        ch_group = QGroupBox("RC Channels")
-        ch_layout = QVBoxLayout(ch_group)
-        self.channel_bars = []
-        ch_names = [
-            "CH1 Roll", "CH2 Pitch", "CH3 Throt", "CH4 Yaw",
-            "CH5 Arm", "CH6 Mode", "CH7 Aux2", "CH8 Aux3"
-        ]
-        for name in ch_names:
-            bar = ChannelBar(name)
-            ch_layout.addWidget(bar)
-            self.channel_bars.append(bar)
-        layout.addWidget(ch_group)
-
-        axes_group = QGroupBox("Raw Axis Values")
-        axes_layout = QGridLayout(axes_group)
-        self.axis_labels = []
-        for i in range(min(self.num_axes, 8)):
-            name_lbl = QLabel(f"Axis {i}:")
-            name_lbl.setStyleSheet("color: #666;")
-            val_lbl = QLabel("0.000")
-            val_lbl.setStyleSheet("color: #0f0; font-weight: bold; font-family: monospace;")
-            axes_layout.addWidget(name_lbl, i, 0)
-            axes_layout.addWidget(val_lbl, i, 1)
-            self.axis_labels.append(val_lbl)
-        layout.addWidget(axes_group)
-
-        btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("Start Calibration")
-        self.start_btn.clicked.connect(self._start_calibration)
-        self.start_btn.setStyleSheet("QPushButton { background-color: #002200; color: #00ff00; font-weight: bold; border: 1px solid #00aa00; }")
-        btn_layout.addWidget(self.start_btn)
-
-        self.save_btn = QPushButton("Save Center")
-        self.save_btn.clicked.connect(self._save_phase)
-        self.save_btn.setEnabled(False)
-        btn_layout.addWidget(self.save_btn)
-
-        self.cancel_btn = QPushButton("Close")
-        self.cancel_btn.clicked.connect(self.close)
-        btn_layout.addWidget(self.cancel_btn)
-        layout.addLayout(btn_layout)
-
-        self.poll_timer = QTimer()
-        self.poll_timer.timeout.connect(self._poll)
-        self.poll_timer.start(20)
-
-    def _poll(self):
-        if not self.joystick:
-            return
-        pygame.event.pump()
-        raw_axes = []
-        for i in range(min(self.num_axes, 8)):
-            raw = self.joystick.get_axis(i)
-            raw_axes.append(raw)
-            if i < len(self.axis_labels):
-                self.axis_labels[i].setText(f"{raw:+.3f}")
-            if self.phase == "extremes":
-                if raw < self.cal.mins[i]:
-                    self.cal.mins[i] = raw
-                if raw > self.cal.maxs[i]:
-                    self.cal.maxs[i] = raw
-
-        if len(raw_axes) >= 4:
-            axes = list(raw_axes) + [0.0] * (8 - len(raw_axes))
-            axes[2] = -axes[2]
-            self.right_stick.set_position(axes[0], axes[1])
-            self.left_stick.set_position(axes[3], axes[2])
-
-            for i in range(min(8, len(raw_axes))):
-                a = axes[i] if i < len(axes) else 0.0
-                pwm = int(1500 + max(-1.0, min(1.0, a)) * 500)
-                if i < len(self.channel_bars):
-                    self.channel_bars[i].set_value(pwm)
-
-    def _start_calibration(self):
-        self.cal.reset(max(self.num_axes, 8))
-        self.phase = "center"
-        self.instruction.setText(
-            "Step 1: Leave all sticks at CENTER position,\n"
-            "then click 'Save Center'."
-        )
-        self.save_btn.setEnabled(True)
-        self.save_btn.setText("Save Center")
-        self.start_btn.setEnabled(False)
-
-    def _save_phase(self):
-        if self.phase == "center":
-            pygame.event.pump()
-            for i in range(min(self.num_axes, 8)):
-                raw = self.joystick.get_axis(i)
-                self.cal.centers[i] = raw
-                self.cal.mins[i] = raw
-                self.cal.maxs[i] = raw
-            self.phase = "extremes"
-            self.instruction.setText(
-                "Step 2: Move ALL sticks to their FULL extremes\n"
-                "(all corners, min/max throttle),\n"
-                "then click 'Save Extremes'."
-            )
-            self.save_btn.setText("Save Extremes")
-        elif self.phase == "extremes":
-            self.cal.calibrated = True
-            self.phase = "done"
-            self.instruction.setText("Calibration complete!")
-            self.save_btn.setEnabled(False)
-            self.start_btn.setEnabled(True)
-            self.start_btn.setText("Recalibrate")
-            self.calibration_done.emit(self.cal)
-
-    def closeEvent(self, event):
-        self.poll_timer.stop()
-        event.accept()
-
-
-# ─── Joystick Monitor Dialog ────────────────────────────────────────
-
-class JoystickMonitorDialog(QWidget):
-    """Floating window showing live stick positions and channel bars."""
-    closed = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Joystick Monitor")
-        self.setMinimumSize(360, 480)
-        self.setStyleSheet(DARK_STYLESHEET)
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-
-        header = QLabel("JOYSTICK MONITOR")
-        header.setAlignment(Qt.AlignCenter)
-        header.setStyleSheet("color: #00cc00; font-size: 13px; font-weight: bold; padding: 4px;")
-        layout.addWidget(header)
-
-        sticks_layout = QHBoxLayout()
-        self.left_stick = StickWidget("Left (Thr/Yaw)")
-        self.right_stick = StickWidget("Right (Pitch/Roll)")
-        sticks_layout.addWidget(self.left_stick)
-        sticks_layout.addWidget(self.right_stick)
-        layout.addLayout(sticks_layout)
-
-        ch_group = QGroupBox("RC Channels")
-        ch_layout = QVBoxLayout(ch_group)
-        self.channel_bars = []
-        ch_names = [
-            "CH1 Roll", "CH2 Pitch", "CH3 Throt", "CH4 Yaw",
-            "CH5 Arm", "CH6 Mode", "CH7 Aux2", "CH8 Aux3"
-        ]
-        for name in ch_names:
-            bar = ChannelBar(name)
-            ch_layout.addWidget(bar)
-            self.channel_bars.append(bar)
-        layout.addWidget(ch_group)
-
-        axes_group = QGroupBox("Raw Axes")
-        axes_layout = QGridLayout(axes_group)
-        self.axis_labels = []
-        for i in range(8):
-            name_lbl = QLabel(f"Axis {i}:")
-            name_lbl.setStyleSheet("color: #666; font-size: 10px;")
-            val_lbl = QLabel("0.000")
-            val_lbl.setStyleSheet("color: #0f0; font-weight: bold; font-family: monospace; font-size: 10px;")
-            axes_layout.addWidget(name_lbl, i // 2, (i % 2) * 2)
-            axes_layout.addWidget(val_lbl, i // 2, (i % 2) * 2 + 1)
-            self.axis_labels.append(val_lbl)
-        layout.addWidget(axes_group)
-        layout.addStretch()
-
-    def update_data(self, raw_axes, axes, channels):
-        if len(axes) >= 4:
-            self.right_stick.set_position(axes[0], axes[1])
-            self.left_stick.set_position(axes[3], axes[2])
-        for i in range(min(8, len(channels))):
-            if i < len(self.channel_bars):
-                self.channel_bars[i].set_value(channels[i])
-        for i in range(min(8, len(raw_axes))):
-            if i < len(self.axis_labels):
-                self.axis_labels[i].setText(f"{raw_axes[i]:+.3f}")
-
-    def closeEvent(self, event):
-        self.closed.emit()
-        event.accept()
-
-
-# ─── Virtual Stick Pad (on-screen joystick, from drone_dash_v2) ─────
-
-class VirtualStickPad(QWidget):
-    """On-screen 2D joystick for roll/pitch. Self-centers on release.
-
-    Emits (roll_pwm, pitch_pwm) in the 1000-2000 CRSF channel range.
-    """
-
-    value_changed = pyqtSignal(int, int)  # roll, pitch
-
-    def __init__(self, size=200, parent=None):
-        super().__init__(parent)
-        self._size = size
-        self.setFixedSize(size, size)
-        self._center = size // 2
-        self._radius = size // 2 - 15
-        self._dot_r = 12
-        self._dot_x = float(self._center)
-        self._dot_y = float(self._center)
-        self._dragging = False
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-
-        # background
-        p.fillRect(self.rect(), QColor("#16213e"))
-
-        c = self._center
-        r = self._radius
-
-        # crosshair
-        p.setPen(QPen(QColor("#2d3a4a"), 1))
-        p.drawLine(c, c - r, c, c + r)
-        p.drawLine(c - r, c, c + r, c)
-
-        # boundary circle
-        p.setPen(QPen(QColor("#0f3460"), 1))
-        p.setBrush(Qt.NoBrush)
-        p.drawEllipse(c - r, c - r, 2 * r, 2 * r)
-
-        # dot
-        p.setBrush(QBrush(QColor("#00b894")))
-        p.setPen(Qt.NoPen)
-        p.drawEllipse(
-            int(self._dot_x - self._dot_r), int(self._dot_y - self._dot_r),
-            2 * self._dot_r, 2 * self._dot_r,
-        )
-
-        # axis labels
-        p.setPen(QColor("#666"))
-        p.setFont(QFont("Arial", 7))
-        p.drawText(c - 16, 10, "Pitch+")
-        p.drawText(c - 16, self._size - 3, "Pitch-")
-        p.drawText(2, c + 3, "R-")
-        p.drawText(self._size - 14, c + 3, "R+")
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._dragging = True
-            self._move_to(event.x(), event.y())
-
-    def mouseMoveEvent(self, event):
-        if self._dragging:
-            self._move_to(event.x(), event.y())
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._dragging = False
-            self._dot_x = float(self._center)
-            self._dot_y = float(self._center)
-            self.update()
-            self.value_changed.emit(1500, 1500)
-
-    def _move_to(self, x, y):
-        dx = x - self._center
-        dy = y - self._center
-        dist = math.hypot(dx, dy)
-        if dist > self._radius:
-            dx = dx / dist * self._radius
-            dy = dy / dist * self._radius
-        self._dot_x = self._center + dx
-        self._dot_y = self._center + dy
-        self.update()
-        roll_pwm = int(1500 + (dx / self._radius) * 500)
-        pitch_pwm = int(1500 - (dy / self._radius) * 500)  # invert Y
-        self.value_changed.emit(roll_pwm, pitch_pwm)
 
 
 # ─── Tab: Control Panel ─────────────────────────────────────────────
@@ -2981,23 +2608,18 @@ class SettingsTab(QWidget):
 
         layout.addWidget(profile_group)
 
-        # ── Protocol Configuration ──
-        proto_group = QGroupBox("Protocol Configuration")
+        # ── MAVLink Connection (UDP) ──
+        proto_group = QGroupBox("MAVLink Connection (UDP)")
         proto_layout = QFormLayout(proto_group)
 
-        self.protocol_select = QComboBox()
-        self.protocol_select.addItems(["ELRS / CRSF", "MAVLink", "MAVLink v2"])
-        proto_layout.addRow("Protocol:", self.protocol_select)
+        self.drone_ip = QLineEdit("127.0.0.1")
+        self.drone_ip.setPlaceholderText("Drone / autopilot IP address")
+        proto_layout.addRow("Drone IP:", self.drone_ip)
 
-        self.baud_rate = QComboBox()
-        self.baud_rate.addItems(["115200", "420000", "921600"])
-        self.baud_rate.setCurrentText("420000")
-        proto_layout.addRow("Baud Rate:", self.baud_rate)
-
-        self.telem_rate = QComboBox()
-        self.telem_rate.addItems(["50 Hz", "100 Hz", "150 Hz", "250 Hz", "500 Hz"])
-        self.telem_rate.setCurrentText("150 Hz")
-        proto_layout.addRow("Telemetry Rate:", self.telem_rate)
+        self.udp_port = QSpinBox()
+        self.udp_port.setRange(1, 65535)
+        self.udp_port.setValue(14550)
+        proto_layout.addRow("UDP Port:", self.udp_port)
 
         layout.addWidget(proto_group)
 
@@ -3354,10 +2976,9 @@ class SettingsTab(QWidget):
                 "battery_capacity": self.battery_capacity.value(),
                 "drone_id": self.drone_id.text(),
             },
-            "protocol": {
-                "type": self.protocol_select.currentText(),
-                "baud": self.baud_rate.currentText(),
-                "telem_rate": self.telem_rate.currentText(),
+            "mavlink": {
+                "drone_ip": self.drone_ip.text(),
+                "udp_port": self.udp_port.value(),
             },
             "video_streaming": {
                 "ip": self.video_stream_ip.text(),
@@ -3430,12 +3051,9 @@ class SettingsTab(QWidget):
             self.battery_capacity.setValue(p.get("battery_capacity", 1500))
             self.drone_id.setText(p.get("drone_id", "WALLE-001"))
 
-            pr = s.get("protocol", {})
-            idx = self.protocol_select.findText(pr.get("type", ""))
-            if idx >= 0:
-                self.protocol_select.setCurrentIndex(idx)
-            self.baud_rate.setCurrentText(pr.get("baud", "420000"))
-            self.telem_rate.setCurrentText(pr.get("telem_rate", "150 Hz"))
+            ml = s.get("mavlink", {})
+            self.drone_ip.setText(ml.get("drone_ip", "127.0.0.1"))
+            self.udp_port.setValue(ml.get("udp_port", 14550))
 
             vs = s.get("video_streaming", {})
             self.video_stream_ip.setText(vs.get("ip", "127.0.0.1"))
@@ -3742,19 +3360,12 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(DARK_STYLESHEET)
 
         # State
-        self.serial_reader = None
-        self.esp32_serial = None  # Serial connection to ESP32 PPM generator
+        self.mav = None  # MAVLinkConnection (UDP link to the vehicle)
         self.video_capture = None
-        self.joystick = None
-        self.channels = [1500] * 16
-        self.channels[2] = 1000  # throttle starts at min
         self.armed = False
         self.flight_mode = "MANUAL"
-        self.calibration = JoystickCalibration()
-        self.cal_window = None
-        self.joy_monitor = None
-        self.last_telemetry = CRSFTelemetry()
-        # arm state derived from CRSF flight mode telemetry (VCP)
+        self.last_telemetry = Telemetry()
+        # arm state + flight mode come from MAVLink HEARTBEAT
         self.recording = False
         self.record_start_time = None
         # Object detection engine
@@ -3765,6 +3376,15 @@ class MainWindow(QMainWindow):
         # Reused buffer for camera|depth side-by-side composite so we don't
         # allocate a fresh ~7 MB numpy array per frame.
         self._stacked_buffer = None
+
+        # Cache for the colorized depth panel + zone decision. The depth map
+        # only changes at depth_target_fps (well below display FPS), so we
+        # recolorize/relabel the panel only when the engine's depth version
+        # advances instead of every displayed frame.
+        self._depth_panel = None          # rendered depth_color (with zones/labels)
+        self._depth_panel_key = None      # (depth_version, fh, fw)
+        self._depth_panel_mode = "CLEAR"
+        self._depth_panel_reason = ""
 
         self.face_rec_engine = FaceRecognitionEngine()
         self.face_rec_enabled = False
@@ -3778,7 +3398,6 @@ class MainWindow(QMainWindow):
         self.slam_engine = SlamEngine()
         self.slam_live_enabled = False
 
-        self._init_pygame()
         self._build_ui()
         self._read_initial_state()
         self._start_timers()
@@ -3835,14 +3454,6 @@ class MainWindow(QMainWindow):
             except Exception as e2:
                 log_main.error("face-rec preload failed: %s", e2)
 
-    def _init_pygame(self):
-        pygame.init()
-        pygame.joystick.init()
-        self.joystick_count = pygame.joystick.get_count()
-        if self.joystick_count > 0:
-            self.joystick = pygame.joystick.Joystick(0)
-            self.joystick.init()
-
     def _build_ui(self):
         central = QWidget()
         central.setStyleSheet("background-color: #0a0a0a;")
@@ -3882,58 +3493,19 @@ class MainWindow(QMainWindow):
 
         self._add_separator(conn_bar)
 
-        conn_bar.addWidget(self._make_label("Telemetry:", "#555"))
-        self.serial_combo = QComboBox()
-        self.serial_combo.setMinimumWidth(160)
-        self._populate_serial_ports()
-        conn_bar.addWidget(self.serial_combo)
-
-        self.serial_btn = QPushButton("Connect")
-        self.serial_btn.setCheckable(True)
-        self.serial_btn.clicked.connect(self._toggle_serial)
-        conn_bar.addWidget(self.serial_btn)
-
-        self._add_separator(conn_bar)
-
-        # ESP32 PPM serial connection
-        esp_label = QLabel("ESP32:")
-        esp_label.setStyleSheet("color: #888; font-size: 11px;")
-        conn_bar.addWidget(esp_label)
-
-        self.esp32_combo = QComboBox()
-        self.esp32_combo.setMinimumWidth(140)
-        conn_bar.addWidget(self.esp32_combo)
-
-        self.esp32_btn = QPushButton("Link")
-        self.esp32_btn.setCheckable(True)
-        self.esp32_btn.clicked.connect(self._toggle_esp32)
-        conn_bar.addWidget(self.esp32_btn)
-
-        self._add_separator(conn_bar)
-
-        self.joy_indicator = QLabel("RC: --")
-        self.joy_indicator.setStyleSheet("color: #555; font-size: 11px;")
-        if self.joystick:
-            self.joy_indicator.setText(f"RC: {self.joystick.get_name()[:18]}")
-            self.joy_indicator.setStyleSheet("color: #00cc00; font-size: 11px;")
-        conn_bar.addWidget(self.joy_indicator)
-
-        self.cal_btn = QPushButton("Cal")
-        self.cal_btn.setToolTip("Calibrate Joystick")
-        self.cal_btn.setFixedWidth(40)
-        self.cal_btn.clicked.connect(self._open_calibration)
-        conn_bar.addWidget(self.cal_btn)
-
-        self.joy_monitor_btn = QPushButton("Mon")
-        self.joy_monitor_btn.setCheckable(True)
-        self.joy_monitor_btn.setToolTip("Toggle joystick monitor")
-        self.joy_monitor_btn.setFixedWidth(40)
-        self.joy_monitor_btn.clicked.connect(self._toggle_joy_monitor)
-        conn_bar.addWidget(self.joy_monitor_btn)
+        # MAVLink-over-UDP link to the vehicle. The drone IP/port come
+        # from Settings; this button opens/closes the link.
+        conn_bar.addWidget(self._make_label("Link:", "#555"))
+        self.mav_btn = QPushButton("Connect")
+        self.mav_btn.setCheckable(True)
+        self.mav_btn.setToolTip("Connect / disconnect the MAVLink UDP link")
+        self.mav_btn.clicked.connect(self._toggle_mav)
+        conn_bar.addWidget(self.mav_btn)
 
         self._add_separator(conn_bar)
 
         self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setToolTip("Rescan video capture devices")
         self.refresh_btn.clicked.connect(self._refresh_devices)
         conn_bar.addWidget(self.refresh_btn)
 
@@ -4098,9 +3670,13 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
 
         self.control_tab = ControlPanelTab()
-        self.control_tab._rc_connected = self.joystick is not None
         self.control_tab.flight_mode_changed.connect(self._on_flight_mode_changed)
         self.control_tab.arm_requested.connect(self._on_arm_requested)
+        # Flight command buttons -> MAVLink commands
+        self.control_tab.takeoff_btn.clicked.connect(self._on_takeoff)
+        self.control_tab.land_btn.clicked.connect(self._on_land)
+        self.control_tab.rth_btn.clicked.connect(self._on_rth)
+        self.control_tab.estop_btn.clicked.connect(self._on_emergency_stop)
         self.stack.addWidget(self.control_tab)
 
         self.detection_tab = DetectionFeedTab()
@@ -4160,16 +3736,9 @@ class MainWindow(QMainWindow):
         self.status_video.setStyleSheet("color: #555; padding: 2px 8px;")
         sb.addWidget(self.status_video)
 
-        self.status_serial = QLabel("Telemetry: OFF")
+        self.status_serial = QLabel("Link: OFF")
         self.status_serial.setStyleSheet("color: #555; padding: 2px 8px;")
         sb.addWidget(self.status_serial)
-
-        self.status_joy = QLabel("RC: --")
-        self.status_joy.setStyleSheet("color: #555; padding: 2px 8px;")
-        if self.joystick:
-            self.status_joy.setText("RC: Connected")
-            self.status_joy.setStyleSheet("color: #00aa00; padding: 2px 8px;")
-        sb.addWidget(self.status_joy)
 
         sb.addWidget(self._make_separator_widget())
 
@@ -4238,45 +3807,19 @@ class MainWindow(QMainWindow):
                 if os.path.exists(f"/dev/video{i}"):
                     self.video_combo.addItem(f"/dev/video{i}", i)
 
-    def _populate_serial_ports(self):
-        self.serial_combo.clear()
-        ports = serial.tools.list_ports.comports()
-        for p in ports:
-            self.serial_combo.addItem(f"{p.device} - {p.description}", p.device)
-        if hasattr(self, 'esp32_combo'):
-            self.esp32_combo.clear()
-            for p in ports:
-                self.esp32_combo.addItem(f"{p.device} - {p.description}", p.device)
-
     def _refresh_devices(self):
         self._populate_video_devices()
-        self._populate_serial_ports()
-        pygame.joystick.quit()
-        pygame.joystick.init()
-        self.joystick_count = pygame.joystick.get_count()
-        if self.joystick_count > 0:
-            self.joystick = pygame.joystick.Joystick(0)
-            self.joystick.init()
-            self.joy_indicator.setText(f"RC: {self.joystick.get_name()[:18]}")
-            self.joy_indicator.setStyleSheet("color: #00cc00; font-size: 11px;")
-            self.status_joy.setText("RC: Connected")
-            self.status_joy.setStyleSheet("color: #00aa00; padding: 2px 8px;")
-            self.sidebar.set_connected(True)
-        else:
-            self.joystick = None
-            self.joy_indicator.setText("RC: --")
-            self.joy_indicator.setStyleSheet("color: #555; font-size: 11px;")
-            self.status_joy.setText("RC: --")
-            self.status_joy.setStyleSheet("color: #555; padding: 2px 8px;")
-            self.sidebar.set_connected(False)
-        self.control_tab._rc_connected = self.joystick is not None
-        self.toast.show_message("Devices refreshed", "#00cc00", 2000)
+        self.toast.show_message("Video devices refreshed", "#00cc00", 2000)
 
     def _toggle_video(self, checked):
         if checked:
             idx = self.video_combo.currentData()
             if idx is not None:
-                self.video_capture = VideoCapture(idx)
+                _vcfg = get_config().video
+                self.video_capture = VideoCapture(
+                    idx,
+                    max_width=_vcfg.capture_max_width,
+                    max_height=_vcfg.capture_max_height)
                 self.video_capture.frame_ready.connect(self._update_video)
                 self.video_capture.start()
                 self.video_btn.setText("Stop")
@@ -4295,85 +3838,68 @@ class MainWindow(QMainWindow):
             self.status_video.setText("Video: OFF")
             self.status_video.setStyleSheet("color: #555; padding: 2px 8px;")
 
-    def _toggle_esp32(self, checked):
+    def _toggle_mav(self, checked):
         if checked:
-            port = self.esp32_combo.currentData()
-            if port:
-                try:
-                    self.esp32_serial = serial.Serial(port, 115200, timeout=0.1)
-                    self.esp32_btn.setText("Unlink")
-                    self.toast.show_message(f"ESP32 linked: {port}", "#00cc00", 2000)
-                    log_esp.info("Connected to %s", port)
-                except Exception as e:
-                    self.esp32_btn.setChecked(False)
-                    self.toast.show_message(f"ESP32 failed: {e}", "#ff3333", 3000)
-                    log_esp.error("%s", e)
-            else:
-                self.esp32_btn.setChecked(False)
+            host = self.settings_tab.drone_ip.text().strip() or "127.0.0.1"
+            port = self.settings_tab.udp_port.value()
+            self.mav = MAVLinkConnection(host, port)
+            self.mav.telemetry_updated.connect(self._update_telemetry)
+            self.mav.link_changed.connect(self._on_link_changed)
+            self.mav.start()
+            self.mav_btn.setText("Disconnect")
+            self.status_serial.setText(f"Link: {host}:{port} (waiting)")
+            self.status_serial.setStyleSheet("color: #ffcc00; padding: 2px 8px;")
+            self.toast.show_message(f"MAVLink link to {host}:{port}", "#00cc00", 2000)
         else:
-            if self.esp32_serial and self.esp32_serial.is_open:
-                self.esp32_serial.close()
-            self.esp32_serial = None
-            self.esp32_btn.setText("Link")
-            self.toast.show_message("ESP32 unlinked", "#ffcc00", 2000)
-
-    def _send_channels_to_esp32(self):
-        """Send channel values to ESP32 PPM generator: roll,pitch,throttle,yaw,arm"""
-        if not self.esp32_serial or not self.esp32_serial.is_open:
-            return
-        try:
-            ch = self.channels
-            # ESP32 expects: roll,pitch,throttle,yaw,switch
-            cmd = f"{ch[0]},{ch[1]},{ch[2]},{ch[3]},{ch[4]}\n"
-            self.esp32_serial.write(cmd.encode())
-        except Exception as e:
-            log_esp.error("Write error: %s", e)
-            try:
-                self.esp32_serial.close()
-            except Exception:
-                pass
-            self.esp32_serial = None
-            self.esp32_btn.setChecked(False)
-            self.esp32_btn.setText("Link")
-
-    def _toggle_serial(self, checked):
-        if checked:
-            port = self.serial_combo.currentData()
-            if not port:
-                # Auto-detect: try each port for CRSF sync bytes
-                self._populate_serial_ports()
-                for i in range(self.serial_combo.count()):
-                    candidate = self.serial_combo.itemData(i)
-                    if candidate:
-                        try:
-                            test_ser = serial.Serial(candidate, 420000, timeout=1.0)
-                            test_data = test_ser.read(512)
-                            test_ser.close()
-                            if any(b in (CRSF_SYNC_BYTE, CRSF_SYNC_BYTE_TX) for b in test_data):
-                                port = candidate
-                                self.serial_combo.setCurrentIndex(i)
-                                break
-                        except Exception:
-                            continue
-            if port:
-                self.serial_reader = SerialReader(port, baud=420000)
-                self.serial_reader.telemetry_updated.connect(self._update_telemetry)
-                self.serial_reader.start()
-                self.serial_btn.setText("Disconnect")
-                self.status_serial.setText(f"Telem: {port}")
-                self.status_serial.setStyleSheet("color: #00aa00; padding: 2px 8px;")
-                self.sidebar.set_connected(True)
-                self.toast.show_message(f"Telemetry connected: {port}", "#00cc00", 2000)
-            else:
-                self.serial_btn.setChecked(False)
-                self.toast.show_message("No CRSF telemetry port found", "#ff4444", 3000)
-        else:
-            if self.serial_reader:
-                self.serial_reader.stop()
-                self.serial_reader = None
-            self.serial_btn.setText("Connect")
-            self.status_serial.setText("Telemetry: OFF")
+            if self.mav:
+                self.mav.stop()
+                self.mav = None
+            self.mav_btn.setText("Connect")
+            self.status_serial.setText("Link: OFF")
             self.status_serial.setStyleSheet("color: #555; padding: 2px 8px;")
+            self.sidebar.set_connected(False)
+            self.toast.show_message("MAVLink link closed", "#ffcc00", 2000)
+
+    def _on_link_changed(self, up):
+        """Heartbeat-based link status from the MAVLink thread."""
+        self.sidebar.set_connected(up)
+        if up:
+            host = self.settings_tab.drone_ip.text().strip() or "127.0.0.1"
+            self.status_serial.setText(f"Link: {host} (heartbeat)")
+            self.status_serial.setStyleSheet("color: #00aa00; padding: 2px 8px;")
+            self.toast.show_message("Vehicle heartbeat received", "#00cc00", 2000)
+        else:
+            self.status_serial.setText("Link: no heartbeat")
+            self.status_serial.setStyleSheet("color: #ff4444; padding: 2px 8px;")
+            self.toast.show_message("Link lost (no heartbeat)", "#ff4444", 3000)
+
+    def _on_takeoff(self):
+        if self.mav:
+            self.mav.takeoff(self.settings_tab.rth_altitude.value())
+            self.toast.show_message("Takeoff command sent", "#5588ee", 2000)
+        else:
+            self.toast.show_message("Not connected", "#ff8844", 2000)
+
+    def _on_land(self):
+        if self.mav:
+            self.mav.land()
+            self.toast.show_message("Land command sent", "#5588ee", 2000)
+        else:
+            self.toast.show_message("Not connected", "#ff8844", 2000)
+
+    def _on_rth(self):
+        if self.mav:
+            self.mav.return_to_launch()
+            self.toast.show_message("RTL command sent", "#ffcc00", 2000)
+        else:
+            self.toast.show_message("Not connected", "#ff8844", 2000)
+
+    def _on_emergency_stop(self):
+        if self.mav:
+            self.mav.emergency_stop()
+            self.toast.show_message("EMERGENCY STOP - motors killed!", "#ff3333", 4000)
+        else:
+            self.toast.show_message("Not connected", "#ff8844", 2000)
 
     def _update_video(self, frame):
         # Feed SLAM with the clean, un-annotated frame *before* any
@@ -4408,33 +3934,49 @@ class MainWindow(QMainWindow):
 
         # Depth side-by-side: original left, colorized depth right
         if self.depth_overlay_enabled and self.detect_engine.is_ready:
-            depth_raw = self.detect_engine.get_depth_map()
-            if depth_raw is not None:
-                depth_norm = _normalize_depth(depth_raw)
-                depth_color = _colorize_depth(depth_norm)
+            fh, fw = frame.shape[:2]
+            cx_lo = int(fw * (0.5 - CENTER_ZONE_FRAC / 2))
+            cx_hi = int(fw * (0.5 + CENTER_ZONE_FRAC / 2))
 
-                fh, fw = frame.shape[:2]
-                if depth_color.shape[:2] != (fh, fw):
-                    depth_color = cv2.resize(depth_color, (fw, fh))
+            # The colorized + labelled depth panel only depends on the depth
+            # map (which updates at depth_target_fps) and the frame size, so
+            # rebuild it only when either changes. Recolorizing identical
+            # depth data every displayed frame is pure wasted GUI-thread work.
+            version = self.detect_engine.get_depth_version()
+            key = (version, fh, fw)
+            if key != self._depth_panel_key:
+                depth_raw = self.detect_engine.get_depth_map()
+                if depth_raw is not None:
+                    depth_norm = _normalize_depth(depth_raw)
+                    depth_color = _colorize_depth(depth_norm)
+                    if depth_color.shape[:2] != (fh, fw):
+                        depth_color = cv2.resize(depth_color, (fw, fh))
 
-                # Zone avoidance decision
-                mode, reason, zl, zc, zr = _depth_decision(depth_norm)
-                cx_lo = int(fw * (0.5 - CENTER_ZONE_FRAC / 2))
-                cx_hi = int(fw * (0.5 + CENTER_ZONE_FRAC / 2))
+                    # Zone avoidance decision
+                    mode, reason, zl, zc, zr = _depth_decision(depth_norm)
 
-                # Draw zones on depth panel
-                cv2.line(depth_color, (cx_lo, 0), (cx_lo, fh), (255, 255, 255), 1)
-                cv2.line(depth_color, (cx_hi, 0), (cx_hi, fh), (255, 255, 255), 1)
+                    # Draw zones on depth panel
+                    cv2.line(depth_color, (cx_lo, 0), (cx_lo, fh), (255, 255, 255), 1)
+                    cv2.line(depth_color, (cx_hi, 0), (cx_hi, fh), (255, 255, 255), 1)
 
-                # Zone labels on depth panel
-                cv2.putText(depth_color, f"L:{zl:.0f}", (10, fh - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(depth_color, f"C:{zc:.0f}", (cx_lo + 5, fh - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(depth_color, f"R:{zr:.0f}", (cx_hi + 5, fh - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                    # Zone labels on depth panel
+                    cv2.putText(depth_color, f"L:{zl:.0f}", (10, fh - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(depth_color, f"C:{zc:.0f}", (cx_lo + 5, fh - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(depth_color, f"R:{zr:.0f}", (cx_hi + 5, fh - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-                # Draw zone lines on camera feed too
+                    self._depth_panel = depth_color
+                    self._depth_panel_mode = mode
+                    self._depth_panel_reason = reason
+                    self._depth_panel_key = key
+
+            if self._depth_panel is not None and self._depth_panel.shape[:2] == (fh, fw):
+                mode = self._depth_panel_mode
+                reason = self._depth_panel_reason
+
+                # Draw zone lines on camera feed too (live frame, every frame)
                 cv2.line(frame, (cx_lo, 0), (cx_lo, fh), (255, 255, 0), 1)
                 cv2.line(frame, (cx_hi, 0), (cx_hi, fh), (255, 255, 0), 1)
 
@@ -4459,12 +4001,18 @@ class MainWindow(QMainWindow):
                         or self._stacked_buffer.shape != need_shape):
                     self._stacked_buffer = np.empty(need_shape, dtype=np.uint8)
                 self._stacked_buffer[:, :fw] = frame
-                self._stacked_buffer[:, fw:] = depth_color
+                self._stacked_buffer[:, fw:] = self._depth_panel
                 frame = self._stacked_buffer
 
                 self.video_widget.hud_depth_mode = mode
 
         self.video_widget.display_frame(frame)
+
+        # Backpressure: tell the capture thread we're ready for the next
+        # frame. Until this fires, the capture loop drops frames instead of
+        # queuing them, so the GUI event loop never backs up.
+        if self.video_capture is not None:
+            self.video_capture.frame_consumed()
 
     def _update_telemetry(self, telem):
         self.last_telemetry = telem
@@ -4519,34 +4067,31 @@ class MainWindow(QMainWindow):
             gps_color = "#00aa00" if telem.satellites >= 6 else "#ffcc00" if telem.satellites >= 3 else "#ff3333"
             self.status_gps.setStyleSheet(f"color: {gps_color}; padding: 2px 8px;")
 
-        # Use CRSF flight mode if available — '*' suffix means disarmed
+        # Flight mode string from the MAVLink HEARTBEAT.
         if telem.flight_mode:
-            raw_mode = telem.flight_mode
-            crsf_armed = not raw_mode.endswith('*')
-            clean_mode = raw_mode.rstrip('*')
-            self.flight_mode = clean_mode
-            self.status_mode.setText(clean_mode)
-            self.video_widget.hud_flight_mode = clean_mode
+            self.flight_mode = telem.flight_mode
+            self.status_mode.setText(telem.flight_mode)
+            self.video_widget.hud_flight_mode = telem.flight_mode
 
-            # Update arm state from CRSF flight mode (not joystick)
-            if crsf_armed != self.armed:
-                self.armed = crsf_armed
-                self.control_tab.set_armed(crsf_armed)
-                self.video_widget.hud_armed = crsf_armed
-                if crsf_armed:
-                    self.status_arm.setText("ARMED")
-                    self.status_arm.setStyleSheet(
-                        "color: #ff0000; font-weight: bold; padding: 2px 12px; "
-                        "background-color: #1a0000; border: 1px solid #330000; border-radius: 4px;"
-                    )
-                    self.toast.show_message("ARMED - Motors active!", "#ff3333", 3000)
-                else:
-                    self.status_arm.setText("DISARMED")
-                    self.status_arm.setStyleSheet(
-                        "color: #00ff00; font-weight: bold; padding: 2px 12px; "
-                        "background-color: #001a00; border: 1px solid #003300; border-radius: 4px;"
-                    )
-                    self.toast.show_message("Disarmed", "#00cc00", 2000)
+        # Arm state is authoritative from the vehicle's HEARTBEAT.
+        if telem.armed != self.armed:
+            self.armed = telem.armed
+            self.control_tab.set_armed(telem.armed)
+            self.video_widget.hud_armed = telem.armed
+            if telem.armed:
+                self.status_arm.setText("ARMED")
+                self.status_arm.setStyleSheet(
+                    "color: #ff0000; font-weight: bold; padding: 2px 12px; "
+                    "background-color: #1a0000; border: 1px solid #330000; border-radius: 4px;"
+                )
+                self.toast.show_message("ARMED - Motors active!", "#ff3333", 3000)
+            else:
+                self.status_arm.setText("DISARMED")
+                self.status_arm.setStyleSheet(
+                    "color: #00ff00; font-weight: bold; padding: 2px 12px; "
+                    "background-color: #001a00; border: 1px solid #003300; border-radius: 4px;"
+                )
+                self.toast.show_message("Disarmed", "#00cc00", 2000)
 
         self.control_tab.update_telemetry(telem)
 
@@ -4566,31 +4111,28 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_arm_requested(self, armed):
-        self.armed = armed
-        self.video_widget.hud_armed = armed
-        if armed:
-            self.status_arm.setText("ARMED")
-            self.status_arm.setStyleSheet(
-                "color: #ff0000; font-weight: bold; padding: 2px 12px; "
-                "background-color: #1a0000; border: 1px solid #330000; border-radius: 4px;"
-            )
-            self.toast.show_message("ARMED - Motors active!", "#ff3333", 3000)
-        else:
-            self.status_arm.setText("DISARMED")
-            self.status_arm.setStyleSheet(
-                "color: #00ff00; font-weight: bold; padding: 2px 12px; "
-                "background-color: #001a00; border: 1px solid #003300; border-radius: 4px;"
-            )
-            self.toast.show_message("Disarmed", "#00cc00", 2000)
-
-        # Update CH5 arm switch and send to ESP32
-        self.channels[4] = 1800 if armed else 1000
-        self._send_channels_to_esp32()
+        # Send the arm/disarm command; the real arm state is reflected
+        # back via HEARTBEAT in _update_telemetry, which updates the
+        # status indicators. We only message the user here.
+        if not self.mav:
+            self.control_tab.set_armed(self.armed)  # revert button toggle
+            self.toast.show_message("Not connected", "#ff8844", 2000)
+            return
+        self.mav.arm(armed)
+        self.toast.show_message(
+            "Arm command sent" if armed else "Disarm command sent",
+            "#5588ee", 2000)
 
     def _on_flight_mode_changed(self, mode):
         self.flight_mode = mode
         self.status_mode.setText(mode)
         self.video_widget.hud_flight_mode = mode
+        if self.mav:
+            # "RTH" in the UI maps to the autopilot's RTL command.
+            if mode.upper() in ("RTH", "RTL"):
+                self.mav.return_to_launch()
+            else:
+                self.mav.set_mode(mode)
 
     def _take_snapshot(self):
         if self.video_widget.pixmap() and not self.video_widget.pixmap().isNull():
@@ -4777,55 +4319,12 @@ class MainWindow(QMainWindow):
         self.video_widget.set_aspect_ratio(w, h)
 
     def _read_initial_state(self):
-        if not self.joystick:
-            return
-        pygame.event.pump()
-        num_axes = self.joystick.get_numaxes()
-        num_buttons = self.joystick.get_numbuttons()
-        log_joy.info("%s: %d axes, %d buttons", self.joystick.get_name(), num_axes, num_buttons)
-        for i in range(num_axes):
-            val = self.joystick.get_axis(i)
-            log_joy.debug("  Axis %d: %+.3f", i, val)
-
-        # Arm state now derived from CRSF flight mode telemetry (VCP), not joystick
+        # Arm state comes from the vehicle's MAVLink HEARTBEAT once
+        # connected; start in the known disarmed state.
         self.control_tab.set_armed(self.armed)
         self.video_widget.hud_armed = self.armed
 
-    def _open_calibration(self):
-        if not self.joystick:
-            self.toast.show_message("No joystick connected", "#ff8844", 2000)
-            return
-        self.cal_window = CalibrationDialog(self.joystick)
-        self.cal_window.calibration_done.connect(self._apply_calibration)
-        self.cal_window.show()
-
-    def _apply_calibration(self, cal):
-        self.calibration = cal
-        self.toast.show_message("Joystick calibration applied", "#00cc00", 2000)
-
-    def _toggle_joy_monitor(self, checked):
-        if checked:
-            if not self.joystick:
-                self.toast.show_message("No joystick connected", "#ff8844", 2000)
-                self.joy_monitor_btn.setChecked(False)
-                return
-            self.joy_monitor = JoystickMonitorDialog(self)
-            self.joy_monitor.closed.connect(self._on_joy_monitor_closed)
-            self.joy_monitor.show()
-        else:
-            if self.joy_monitor:
-                self.joy_monitor.close()
-                self.joy_monitor = None
-
-    def _on_joy_monitor_closed(self):
-        self.joy_monitor = None
-        self.joy_monitor_btn.setChecked(False)
-
     def _start_timers(self):
-        self.joy_timer = QTimer()
-        self.joy_timer.timeout.connect(self._poll_joystick)
-        self.joy_timer.start(20)  # 50Hz
-
         # Recording timer
         self.rec_timer = QTimer()
         self.rec_timer.timeout.connect(self._update_recording_time)
@@ -4836,35 +4335,6 @@ class MainWindow(QMainWindow):
             elapsed = int(time.time() - self.record_start_time)
             self.video_widget.hud_record_time = elapsed
 
-    def _poll_joystick(self):
-        if not self.joystick:
-            # No joystick: still stream current channel state
-            # (e.g. arm channel set by _on_arm_requested) to ESP32.
-            self._send_channels_to_esp32()
-            return
-
-        try:
-            pygame.event.pump()
-        except pygame.error:
-            return
-
-        num_axes = self.joystick.get_numaxes()
-        raw_axes = [self.joystick.get_axis(i) if i < num_axes else 0.0 for i in range(8)]
-        axes = [self.calibration.apply(i, raw_axes[i]) for i in range(8)]
-        axes[2] = -axes[2]  # invert throttle
-
-        for i in range(min(8, num_axes)):
-            pwm = int(1500 + max(-1.0, min(1.0, axes[i])) * 500)
-            self.channels[i] = pwm
-
-        if self.joy_monitor and self.joy_monitor.isVisible():
-            self.joy_monitor.update_data(raw_axes, axes, self.channels[:8])
-
-        # Send channel data to ESP32 PPM generator
-        self._send_channels_to_esp32()
-
-        # Arm state now derived from CRSF flight mode telemetry (VCP)
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         # Reposition toast at top-center
@@ -4873,14 +4343,12 @@ class MainWindow(QMainWindow):
             self.toast.setGeometry((self.width() - tw) // 2, 60, tw, 40)
 
     def closeEvent(self, event):
-        self.joy_timer.stop()
         self.rec_timer.stop()
         if self.video_capture:
             self.video_capture.stop()
-        if self.serial_reader:
-            self.serial_reader.stop()
-        if self.esp32_serial and self.esp32_serial.is_open:
-            self.esp32_serial.close()
+        if self.mav:
+            self.mav.stop()
+            self.mav = None
         self.detect_engine.stop()
         if hasattr(self, "slam_tab"):
             try:
@@ -4892,7 +4360,6 @@ class MainWindow(QMainWindow):
                 self.recon_tab.shutdown()
             except Exception:
                 pass
-        pygame.quit()
         event.accept()
 
 
