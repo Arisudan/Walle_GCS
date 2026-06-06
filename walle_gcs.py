@@ -2612,14 +2612,28 @@ class SettingsTab(QWidget):
         proto_group = QGroupBox("MAVLink Connection (UDP)")
         proto_layout = QFormLayout(proto_group)
 
+        self.mav_mode = QComboBox()
+        self.mav_mode.addItems(["Listen (drone -> GCS)", "Connect (GCS -> drone)"])
+        self.mav_mode.setToolTip(
+            "Listen: GCS binds the UDP port and the drone/companion pushes "
+            "its MAVLink stream to it (QGroundControl default; most SBC setups).\n"
+            "Connect: GCS actively sends to the Drone IP (only for vehicles "
+            "that act as a UDP server, e.g. some SITL setups).")
+        proto_layout.addRow("Mode:", self.mav_mode)
+
         self.drone_ip = QLineEdit("127.0.0.1")
-        self.drone_ip.setPlaceholderText("Drone / autopilot IP address")
+        self.drone_ip.setPlaceholderText("Drone / autopilot IP (Connect mode only)")
         proto_layout.addRow("Drone IP:", self.drone_ip)
 
         self.udp_port = QSpinBox()
         self.udp_port.setRange(1, 65535)
         self.udp_port.setValue(14550)
         proto_layout.addRow("UDP Port:", self.udp_port)
+
+        # Drone IP is only used in Connect mode; grey it out in Listen mode.
+        self.mav_mode.currentIndexChanged.connect(
+            lambda i: self.drone_ip.setEnabled(i == 1))
+        self.drone_ip.setEnabled(False)
 
         layout.addWidget(proto_group)
 
@@ -2977,6 +2991,7 @@ class SettingsTab(QWidget):
                 "drone_id": self.drone_id.text(),
             },
             "mavlink": {
+                "mode": self.mav_mode.currentIndex(),
                 "drone_ip": self.drone_ip.text(),
                 "udp_port": self.udp_port.value(),
             },
@@ -3052,6 +3067,7 @@ class SettingsTab(QWidget):
             self.drone_id.setText(p.get("drone_id", "WALLE-001"))
 
             ml = s.get("mavlink", {})
+            self.mav_mode.setCurrentIndex(ml.get("mode", 0))
             self.drone_ip.setText(ml.get("drone_ip", "127.0.0.1"))
             self.udp_port.setValue(ml.get("udp_port", 14550))
 
@@ -3842,14 +3858,16 @@ class MainWindow(QMainWindow):
         if checked:
             host = self.settings_tab.drone_ip.text().strip() or "127.0.0.1"
             port = self.settings_tab.udp_port.value()
-            self.mav = MAVLinkConnection(host, port)
+            mode = "connect" if self.settings_tab.mav_mode.currentIndex() == 1 else "listen"
+            self.mav = MAVLinkConnection(host, port, mode=mode)
             self.mav.telemetry_updated.connect(self._update_telemetry)
             self.mav.link_changed.connect(self._on_link_changed)
             self.mav.start()
             self.mav_btn.setText("Disconnect")
-            self.status_serial.setText(f"Link: {host}:{port} (waiting)")
+            where = f"{host}:{port}" if mode == "connect" else f":{port} (listening)"
+            self.status_serial.setText(f"Link: {where} (waiting)")
             self.status_serial.setStyleSheet("color: #ffcc00; padding: 2px 8px;")
-            self.toast.show_message(f"MAVLink link to {host}:{port}", "#00cc00", 2000)
+            self.toast.show_message(f"MAVLink {mode} {where}", "#00cc00", 2000)
         else:
             if self.mav:
                 self.mav.stop()

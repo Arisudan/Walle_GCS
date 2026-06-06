@@ -76,9 +76,18 @@ class MAVLinkConnection(QThread):
     Parameters
     ----------
     host, port:
-        Drone endpoint. The link is opened as ``udpout:host:port`` —
-        the GCS sends to that address and receives the vehicle's
-        replies on the same socket.
+        Drone endpoint / local bind port.
+    mode:
+        ``"listen"`` (default) opens ``udpin:0.0.0.0:port`` — the GCS
+        binds the port and waits for the vehicle/companion to push its
+        MAVLink stream to it (the QGroundControl default, and what most
+        companion SBCs do with ``--out udp:<GCS_IP>:port``). Outbound
+        commands are sent to whichever address the stream arrives from.
+
+        ``"connect"`` opens ``udpout:host:port`` — the GCS actively sends
+        to ``host:port`` and receives replies on the same socket. Use this
+        only when the vehicle side is a UDP server (e.g. some SITL setups)
+        waiting for the GCS to initiate.
     """
 
     telemetry_updated = pyqtSignal(object)
@@ -88,10 +97,11 @@ class MAVLinkConnection(QThread):
 
     LINK_TIMEOUT = 3.0  # seconds without a heartbeat before link is "lost"
 
-    def __init__(self, host, port, source_system=255):
+    def __init__(self, host, port, mode="listen", source_system=255):
         super().__init__()
         self.host = host
         self.port = int(port)
+        self.mode = mode
         self.source_system = source_system
         self.running = False
         self.master = None
@@ -104,7 +114,11 @@ class MAVLinkConnection(QThread):
 
     # ─── thread main loop ───────────────────────────────────────────
     def run(self):
-        conn_str = f"udpout:{self.host}:{self.port}"
+        if self.mode == "connect":
+            conn_str = f"udpout:{self.host}:{self.port}"
+        else:
+            # Listen mode: bind the port and let the vehicle push to us.
+            conn_str = f"udpin:0.0.0.0:{self.port}"
         try:
             self.master = mavutil.mavlink_connection(
                 conn_str, source_system=self.source_system)
@@ -119,9 +133,13 @@ class MAVLinkConnection(QThread):
         while self.running:
             now = time.time()
 
-            # Periodic GCS heartbeat. For udpout this is also what tells
-            # the vehicle where to send its telemetry stream.
-            if now - last_tx > 1.0:
+            # Periodic GCS heartbeat. In connect (udpout) mode this also
+            # tells the vehicle where to send its telemetry stream, so we
+            # send from the start. In listen (udpin) mode we have no peer
+            # address until the first packet arrives, so hold off until
+            # then to avoid "no address" send errors.
+            can_tx = self.mode == "connect" or self._last_heartbeat > 0
+            if can_tx and now - last_tx > 1.0:
                 self._send_gcs_heartbeat()
                 last_tx = now
 
