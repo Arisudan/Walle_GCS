@@ -35,12 +35,18 @@ from PyQt5.QtWidgets import (
 
 def find_lingbot_map_dir():
     """Locate the LingBot-Map checkout (the dir containing ``demo.py``)."""
+    env_dir = os.environ.get("WALLE_LINGBOT_MAP_DIR")
+    if env_dir:
+        env_dir = os.path.abspath(env_dir)
+        if os.path.isfile(os.path.join(env_dir, "demo.py")):
+            return env_dir
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(here, "..", "..", "lingbot-map"),        # rosetta/walle_gcs/ -> ../../lingbot-map
+        os.path.join(here, "lingbot-map"),                  # walle_gcs/ -> ./lingbot-map
         os.path.join(here, "..", "lingbot-map"),              # rosetta/ -> ../lingbot-map
-        os.path.join(here, "..", "..", "lingbot-map-fresh"),
+        os.path.join(here, "..", "..", "lingbot-map"),        # rosetta/walle_gcs/ -> ../../lingbot-map
         os.path.join(here, "..", "lingbot-map-fresh"),
+        os.path.join(here, "..", "..", "lingbot-map-fresh"),
         "/home/ndrone/Downloads/Drone Development/Drone Development/lingbot-map",
     ]
     for c in candidates:
@@ -55,8 +61,15 @@ LINGBOT_DIR = find_lingbot_map_dir()
 
 def _venv_python(lingbot_dir):
     """LingBot-Map's own interpreter — falls back to system python3."""
-    p = os.path.join(lingbot_dir, "venv", "bin", "python3")
-    return p if os.path.isfile(p) else "python3"
+    candidates = [
+        os.path.join(lingbot_dir, "venv", "Scripts", "python.exe"),
+        os.path.join(lingbot_dir, "venv", "bin", "python3"),
+        os.path.join(lingbot_dir, "venv", "bin", "python"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return "python3"
 
 
 def _model_path(lingbot_dir):
@@ -346,11 +359,16 @@ class ReconstructionTab(QWidget):
         problems = []
         if not os.path.isfile(demo):
             problems.append(f"demo.py not found in {self.lingbot_dir}")
+        if not os.path.isdir(self.lingbot_dir):
+            problems.append("LingBot-Map directory does not exist")
         if not os.path.isfile(model):
             problems.append(f"checkpoint missing: {model}")
         if problems:
             self.run_btn.setEnabled(False)
-            self.status_label.setText("LingBot-Map not found — " + "; ".join(problems))
+            self.status_label.setText(
+                "LingBot-Map not found. Set WALLE_LINGBOT_MAP_DIR to the checkout containing demo.py. "
+                + "; ".join(problems)
+            )
             self.status_label.setStyleSheet("color: #ff6666; font-size: 11px; padding: 2px 4px;")
 
     # ── Source selection ────────────────────────────────────────────────
