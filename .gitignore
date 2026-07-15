@@ -8,3 +8,6 @@ walle_gcs_max_commit_plan.docx
 venv/
 .pt
 *.pt
+
+# Large third-party datasets — excluded to keep repo size manageable
+lingbot-map/
