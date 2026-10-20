@@ -11,3 +11,40 @@ venv/
 
 # Large third-party datasets — excluded to keep repo size manageable
 lingbot-map/
+
+# --- backup ignore: large/regenerable files ---
+venv/
+.venv/
+env/
+node_modules/
+__pycache__/
+.cache/
+.ipynb_checkpoints/
+datasets/
+dataset/
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.mkv
+*.zip
+*.7z
+*.tar
+*.gz
+*.rar
+*.pt
+*.pth
+*.onnx
+*.engine
+*.bag
+*.ckpt
+*.safetensors
+*.h5
+*.npz
+*.npy
+*.db3
+.env
+.env.*
+*.pem
+*.key
